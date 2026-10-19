@@ -12,7 +12,7 @@
   "dependencies": {
     "dotenv": "^18.0.8",
     "express": "^4.21.2",
-    "nodemailer": "^10.1.0",
+    "nodemailer": "^10.1.2",
     "socket.io": "^4.8.1"
   },
   "devDependencies": {
