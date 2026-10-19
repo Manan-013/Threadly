@@ -1,0 +1,323 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@700;800&display=swap');
+
+:root {
+  --threadly-ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --threadly-ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --threadly-ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.threadly-ext-root {
+  font-family: 'Google Sans', 'Inter', Roboto, -apple-system, BlinkMacSystemFont, sans-serif;
+  color: #0F172A;
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+}
+
+.threadly-ext-root button {
+  transition:
+    transform 160ms var(--threadly-ease-out),
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    opacity 150ms ease;
+}
+
+.threadly-ext-root button:not(:disabled):active {
+  transform: scale(0.97);
+}
+
+.threadly-ext-brand {
+  font-family: 'Plus Jakarta Sans', 'Google Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-weight: 800;
+  color: #0F172A;
+  letter-spacing: -0.03em;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* LEFT SIDEBAR INJECTION INSIDE GMAIL NAV (Compact 28px native Gmail row height) */
+#threadly-left-nav-container {
+  margin: 2px 0 4px 0;
+  padding: 2px 0;
+  font-family: 'Google Sans', Roboto, -apple-system, BlinkMacSystemFont, sans-serif;
+  position: relative;
+}
+
+.threadly-nav-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 28px;
+  padding: 0 12px 0 0;
+  margin-right: 8px;
+  border-radius: 0 16px 16px 0;
+  font-size: 13px;
+  color: #202124;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease,
+    transform 140ms var(--threadly-ease-out);
+}
+
+.threadly-nav-item:active {
+  transform: scale(0.985);
+}
+
+.threadly-caret-gutter {
+  width: 26px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #5F6368;
+  font-size: 10px;
+}
+
+.threadly-icon-slot {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-right: 16px;
+}
+
+.threadly-nav-item.threadly-nav-subitem {
+  padding-left: 42px;
+  height: 26px;
+}
+
+.threadly-nav-item.threadly-nav-subitem .threadly-icon-slot {
+  margin-right: 12px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .threadly-nav-item:hover {
+    background-color: #EAEBEF;
+  }
+}
+
+.threadly-nav-item.threadly-active {
+  background-color: #FEE2E2;
+  color: #991B1B;
+  font-weight: 600;
+}
+
+.threadly-nav-left {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.threadly-nav-badge {
+  font-size: 12px;
+  font-weight: 600;
+  color: #5F6368;
+  margin-left: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.threadly-nav-item.threadly-active .threadly-nav-badge {
+  color: #991B1B;
+  font-weight: 700;
+}
+
+/* SLIDE-OVER DRAWER FOR TEAM / ALL VIEWS / TAGS */
+#threadly-left-slideover {
+  position: fixed;
+  top: 64px;
+  left: 0;
+  bottom: 0;
+  width: 256px;
+  background: #FFFFFF;
+  border-right: 1px solid #E2E8F0;
+  border-top-right-radius: 16px;
+  border-bottom-right-radius: 16px;
+  box-shadow: 6px 0 24px rgba(15, 23, 42, 0.12);
+  z-index: 9998;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 12px;
+  box-sizing: border-box;
+  font-family: 'Google Sans', Roboto, sans-serif;
+  transform-origin: left center;
+  opacity: 1;
+  transform: translateX(0);
+  transition:
+    transform 260ms var(--threadly-ease-drawer),
+    opacity 200ms var(--threadly-ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: translateX(-14px);
+  }
+}
+
+/* RIGHT SIDEBAR */
+#threadly-gmail-sidebar {
+  position: fixed;
+  top: 64px;
+  right: 0;
+  bottom: 0;
+  width: 316px;
+  background: #FFFFFF;
+  border-left: 1px solid #E2E8F0;
+  z-index: 9990;
+  display: flex;
+  flex-direction: column;
+  box-shadow: -4px 0 16px rgba(15, 23, 42, 0.06);
+  transition: transform 260ms var(--threadly-ease-drawer);
+}
+
+#threadly-gmail-sidebar.threadly-collapsed {
+  transform: translateX(316px);
+}
+
+/* TOP BAR WIDGET */
+#threadly-gmail-topbar-widget {
+  position: fixed;
+  top: 10px;
+  right: 165px;
+  z-index: 9995;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #FFFFFF;
+  border: 1px solid #FECACA;
+  padding: 5px 12px;
+  border-radius: 9999px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 12px rgba(220, 38, 38, 0.08);
+  font-family: 'Google Sans', 'Inter', sans-serif;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.threadly-btn-crimson {
+  background: #DC2626;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    transform 160ms var(--threadly-ease-out),
+    background-color 150ms ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .threadly-btn-crimson:hover {
+    background: #B91C1C;
+  }
+}
+
+.threadly-btn-crimson:active {
+  transform: scale(0.97);
+}
+
+/* COMPOSE BAR REVEAL (Origin-aware from top-left trigger, 180ms --threadly-ease-out) */
+.threadly-compose-bar {
+  transform-origin: top left;
+  opacity: 1;
+  transform: translateY(0);
+  filter: blur(0px);
+  transition:
+    transform 180ms var(--threadly-ease-out),
+    opacity 180ms var(--threadly-ease-out),
+    filter 180ms ease;
+
+  @starting-style {
+    opacity: 0;
+    transform: translateY(-4px);
+    filter: blur(2px);
+  }
+}
+
+.threadly-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(2px);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 1;
+  transition: opacity 200ms var(--threadly-ease-out);
+
+  @starting-style {
+    opacity: 0;
+  }
+}
+
+.threadly-modal-card {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 12px;
+  width: 500px;
+  max-width: 92vw;
+  padding: 20px;
+  box-shadow: 0 2px 4px rgba(15, 23, 42, 0.04), 0 24px 48px -12px rgba(15, 23, 42, 0.18);
+  font-family: 'Google Sans', 'Inter', sans-serif;
+  transform-origin: center;
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  transition:
+    transform 220ms var(--threadly-ease-out),
+    opacity 220ms var(--threadly-ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.96) translateY(6px);
+  }
+}
+
+.threadly-iframe-fullscreen {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  background: #F8FAFC;
+  z-index: 999999;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: none;
+  border-radius: 0;
+  margin: 0;
+  padding: 0;
+  box-shadow: none;
+  animation: threadlyFadeIn 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes threadlyFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+
+@media (prefers-reduced-motion: reduce) {
+  .threadly-ext-root *,
+  #threadly-left-slideover,
+  #threadly-gmail-sidebar,
+  .threadly-modal-card,
+  .threadly-compose-bar {
+    transition-duration: 120ms !important;
+    transform: none !important;
+  }
+}

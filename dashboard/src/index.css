@@ -1,0 +1,221 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Emil Kowalski Design Engineering Tokens */
+:root {
+  /* Strong ease-out for UI entrances, exits, and responsive feedback */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  /* Strong ease-in-out for on-screen morphing & movement */
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  /* iOS-like drawer curve (from Ionic / Apple Fluid Interfaces) */
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Enterprise Crimson Surface & Border Tokens */
+  --crimson-primary: #DC2626;
+  --crimson-hover: #B91C1C;
+  --crimson-deep: #991B1B;
+  --crimson-tint: #FEF2F2;
+  --crimson-soft: #FEE2E2;
+  --crimson-border: #FECACA;
+  --surface-hairline: rgba(15, 23, 42, 0.08);
+  --shadow-popover: 0 1px 2px rgba(15, 23, 42, 0.04), 0 12px 28px -4px rgba(15, 23, 42, 0.12), 0 0 0 1px rgba(15, 23, 42, 0.04);
+  --shadow-modal: 0 2px 4px rgba(15, 23, 42, 0.04), 0 24px 48px -12px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(15, 23, 42, 0.06);
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.03), 0 4px 12px -2px rgba(15, 23, 42, 0.05);
+}
+
+@layer base {
+  body {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  h1, h2, h3, h4 {
+    letter-spacing: -0.015em;
+  }
+
+  /* Responsive tactile button feedback (160ms ease-out, scale 0.97 on active) */
+  button:not(:disabled) {
+    transition:
+      transform 160ms var(--ease-out),
+      background-color 150ms ease,
+      border-color 150ms ease,
+      color 150ms ease,
+      box-shadow 150ms ease,
+      opacity 150ms ease;
+  }
+
+  button:not(:disabled):active {
+    transform: scale(0.97);
+  }
+}
+
+.font-brand {
+  font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+/* Tabular numerals for counters, badges, SLA timers, and timestamps */
+.tabular-nums,
+.font-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Origin-aware Popovers & Dropdowns (180ms --ease-out, never scale(0), anchored to trigger) */
+.threadly-popover-top-right {
+  transform-origin: top right;
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  box-shadow: var(--shadow-popover);
+  transition:
+    transform 180ms var(--ease-out),
+    opacity 180ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.96) translateY(-4px);
+  }
+}
+
+.threadly-popover-top-left {
+  transform-origin: top left;
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  box-shadow: var(--shadow-popover);
+  transition:
+    transform 180ms var(--ease-out),
+    opacity 180ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.96) translateY(-4px);
+  }
+}
+
+.threadly-popover-bottom-left {
+  transform-origin: bottom left;
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  box-shadow: var(--shadow-popover);
+  transition:
+    transform 180ms var(--ease-out),
+    opacity 180ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.96) translateY(4px);
+  }
+}
+
+/* Centered Modals (transform-origin: center, 220ms --ease-out, scale 0.96 -> 1) */
+.threadly-modal-backdrop {
+  opacity: 1;
+  backdrop-filter: blur(2px);
+  transition: opacity 200ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+  }
+}
+
+.threadly-modal-surface {
+  transform-origin: center;
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  box-shadow: var(--shadow-modal);
+  transition:
+    transform 220ms var(--ease-out),
+    opacity 220ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.96) translateY(6px);
+  }
+}
+
+/* Spatial Slide-Over Drawer (260ms --ease-drawer) */
+.threadly-drawer-left {
+  transform-origin: left center;
+  opacity: 1;
+  transform: translateX(0);
+  box-shadow: 8px 0 28px -4px rgba(15, 23, 42, 0.12);
+  transition:
+    transform 260ms var(--ease-drawer),
+    opacity 200ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+}
+
+.threadly-drawer-right {
+  transform-origin: right center;
+  opacity: 1;
+  transform: translateX(0);
+  transition:
+    transform 260ms var(--ease-drawer),
+    opacity 200ms var(--ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+}
+
+/* Compose Hexagon Tray Reveal (origin-aware from top-left trigger, 180ms --ease-out) */
+.threadly-compose-tray {
+  transform-origin: top left;
+  opacity: 1;
+  transform: translateY(0);
+  filter: blur(0px);
+  transition:
+    transform 180ms var(--ease-out),
+    opacity 180ms var(--ease-out),
+    filter 180ms ease;
+
+  @starting-style {
+    opacity: 0;
+    transform: translateY(-4px);
+    filter: blur(2px);
+  }
+}
+
+/* Subtle list row hover gated for pointer devices */
+@media (hover: hover) and (pointer: fine) {
+  .threadly-row-interactive:hover {
+    background-color: #F8FAFC;
+  }
+}
+
+/* Accessibility: Reduced Motion keeps opacity/color comprehension, removes movement */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 120ms !important;
+    transform: none !important;
+  }
+}
+
+/* Custom subtle scrollbars matching Google Workspace & Hiver */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}

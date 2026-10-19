@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment & Credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# SQLite Databases & Local Storage
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+backend/data/*.sqlite*
+
+# Build outputs
+dist/
+build/
+.cache/
+
+# Logs & Temporary files
+*.log
+.system_generated/
+scratch/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Screenshots & Local zip dumps
+Screenshot*.png
+*.zip

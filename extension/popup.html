@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Threadly Extension</title>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@700;800&display=swap');
+      :root {
+        --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+      }
+      body {
+        width: 300px;
+        margin: 0;
+        padding: 16px;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        background: #FFFFFF;
+        color: #0F172A;
+        -webkit-font-smoothing: antialiased;
+        font-variant-numeric: tabular-nums;
+      }
+      .brand-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .brand {
+        font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        color: #0F172A;
+        font-size: 19px;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+      }
+      .card {
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 10px;
+        padding: 12px;
+        margin-top: 12px;
+        font-size: 12px;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+      }
+      .btn {
+        display: block;
+        width: 100%;
+        text-align: center;
+        padding: 9px 12px;
+        background: #DC2626;
+        color: #FFFFFF;
+        border: none;
+        border-radius: 8px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        margin-top: 12px;
+        text-decoration: none;
+        box-sizing: border-box;
+        transition:
+          transform 160ms var(--ease-out),
+          background-color 150ms ease;
+      }
+      @media (hover: hover) and (pointer: fine) {
+        .btn:hover {
+          background: #B91C1C;
+        }
+      }
+      .btn:active {
+        transform: scale(0.97);
+      }
+    </style>
+  </head>
+  <body>
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <div class="brand-wrap">
+        <svg width="24" height="24" viewBox="0 0 36 36" fill="none">
+          <rect x="2" y="2" width="32" height="32" rx="9" fill="#DC2626"/>
+          <path d="M10.5 12.5H25.5" stroke="#FFFFFF" stroke-width="2.8" stroke-linecap="round"/>
+          <path d="M18 12.5V22.5C18 24.9853 20.0147 27 22.5 27C24.433 27 26 25.433 26 23.5C26 21.567 24.433 20 22.5 20H14C11.7909 20 10 18.2091 10 16" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="25.5" cy="12.5" r="2" fill="#FECACA"/>
+        </svg>
+        <span class="brand">Thread<span style="color:#DC2626;">ly</span></span>
+      </div>
+      <span id="server-status" style="font-size:11px;color:#059669;font-weight:600;">Checking...</span>
+    </div>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:4px;letter-spacing:-0.01em;">Unified Gmail &amp; Dashboard Sync</div>
+      <div id="setup-summary" style="color:#64748B;">Connecting to http://localhost:4000...</div>
+    </div>
+    <button id="open-dashboard" class="btn">Open Standalone Web Dashboard</button>
+    <script src="popup.js"></script>
+  </body>
+</html>
