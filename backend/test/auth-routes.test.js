@@ -39,7 +39,7 @@ test('route inventory is non-trivial (guards the table-driven tests below)', () 
   assert.deepEqual(publicOnes, [
     'GET /api/auth/google/callback',
     'GET /api/health',
-    'GET /api/shared/:codeOrToken',
+    'GET /api/shared/:token',
     'POST /api/auth/login',
     'POST /api/auth/register',
   ]);

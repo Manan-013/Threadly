@@ -169,6 +169,13 @@ db.exec(`
     updated_at TEXT DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS counters (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO counters (name, value)
+    SELECT 'conversation_code', COALESCE((SELECT MAX(id) FROM conversations), 0);
+
   CREATE TABLE IF NOT EXISTS conversation_tags (
     conversation_id INTEGER NOT NULL,
     tag_id INTEGER NOT NULL,
@@ -390,15 +397,18 @@ try {
 
 const crypto = require('node:crypto');
 
+// Conversation codes look like 0042-A3F1. The number comes from a persistent, atomically incremented
+// counter (never MAX(id)/COUNT(*), which repeat after deletes), so two codes can never collide.
+// The random suffix only makes codes non-enumerable.
 function generateConversationCode() {
-  const row = db.prepare('SELECT MAX(id) as maxId FROM conversations').get();
-  const nextNum = (row?.maxId || 0) + 1;
+  const row = db.prepare("UPDATE counters SET value = value + 1 WHERE name = 'conversation_code' RETURNING value").get();
   const suffix = crypto.randomBytes(2).toString('hex').toUpperCase();
-  return `${String(nextNum).padStart(4, '0')}-${suffix}`;
+  return `${String(row.value).padStart(4, '0')}-${suffix}`;
 }
 
+// 192 bits of randomness, URL-safe. Used for public share tokens and webhook secrets.
 function generateToken() {
-  return crypto.randomBytes(24).toString('hex');
+  return crypto.randomBytes(24).toString('base64url');
 }
 
 function logActivity(conversationId, actorName, activityType, description, metadata = {}) {

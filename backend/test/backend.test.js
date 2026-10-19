@@ -7,15 +7,15 @@ const { analyzeSentiment, isThankYouReply, evaluateCondition } = require('../src
 test('Token Generation', () => {
   const token1 = generateToken();
   const token2 = generateToken();
-  
+
   assert.equal(typeof token1, 'string');
-  assert.equal(token1.length, 48, 'Crypto token must be 48 hex characters (24 bytes)');
+  assert.match(token1, /^[A-Za-z0-9_-]{32}$/, '24 random bytes encoded as base64url');
   assert.notEqual(token1, token2, 'Generated tokens must be distinct');
 });
 
 test('Conversation Code Generation', () => {
   const code = generateConversationCode();
-  assert.match(code, /^\d{4}-[0-9A-F]{4}$/, 'Code must match XXXX-XXXX hex suffix format');
+  assert.match(code, /^\d{4,}-[0-9A-F]{4}$/, 'Code must look like 0001-A3F1');
 });
 
 test('Sentiment Analysis Engine', () => {

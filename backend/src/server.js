@@ -734,37 +734,41 @@ app.get('/api/conversations/:id', (req, res) => {
   res.json(conv);
 });
 
-// Public Share Permalink Lookup: requires explicit public_link_enabled = 1 and public_token match
-app.get('/api/shared/:codeOrToken', (req, res) => {
-  const token = req.params.codeOrToken;
-  // Match only against public_token when public_link_enabled is true
-  const row = db.prepare(`
-    SELECT id FROM conversations
+// Public share permalink (no session). Matches ONLY the unguessable public_token and only while the
+// owner has the link enabled; conversation codes and numeric ids never resolve here. The response is
+// built from an explicit allowlist of columns: internal notes, activity log, assignee, watchers,
+// tags, drafts, email addresses and private split replies are never loaded for this route.
+const PUBLIC_TOKEN_PATTERN = /^[A-Za-z0-9_-]{20,128}$/;
+
+app.get('/api/shared/:token', (req, res) => {
+  res.set({ 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow', 'Referrer-Policy': 'no-referrer' });
+  const token = req.params.token;
+  const notFound = () => res.status(404).json({ error: 'Public link is disabled or invalid.' });
+  if (!PUBLIC_TOKEN_PATTERN.test(token)) return notFound();
+
+  const conv = db.prepare(`
+    SELECT id, conversation_code, subject, customer_name, status, created_at, updated_at
+    FROM conversations
     WHERE public_token = ? AND public_link_enabled = 1
   `).get(token);
+  if (!conv) return notFound();
 
-  if (!row) {
-    return res.status(404).json({ error: 'Public link is disabled or invalid.' });
-  }
+  const messages = db.prepare(`
+    SELECT id, sender_name, is_agent_reply, body, created_at
+    FROM messages
+    WHERE conversation_id = ? AND is_private_split = 0 AND status = 'sent'
+    ORDER BY id ASC
+  `).all(conv.id);
 
-  const full = hydrateConversation(row.id);
-  if (!full) return res.status(404).json({ error: 'Conversation not found' });
-
-  // Security: Never leak internal notes, watchers, or internal drafts over public permalinks
-  const sanitized = {
-    id: full.id,
-    conversation_code: full.conversation_code,
-    subject: full.subject,
-    customer_name: full.customer_name,
-    customer_email: full.customer_email,
-    status: full.status,
-    priority: full.priority,
-    created_at: full.created_at,
-    updated_at: full.updated_at,
-    messages: (full.messages || []).filter(m => !m.is_private_split),
-    tags: full.tags,
-  };
-  res.json(sanitized);
+  res.json({
+    conversation_code: conv.conversation_code,
+    subject: conv.subject,
+    customer_name: conv.customer_name,
+    status: conv.status,
+    created_at: conv.created_at,
+    updated_at: conv.updated_at,
+    messages,
+  });
 });
 
 // Used by both the Dashboard (Compose / Receive Inbound) and Gmail Extension Sync
@@ -936,6 +940,10 @@ app.patch('/api/conversations/:id', (req, res) => {
   if (public_link_enabled !== undefined) {
     db.prepare(`UPDATE conversations SET public_link_enabled = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(public_link_enabled ? 1 : 0, convId);
+    if (!public_link_enabled && conv.public_link_enabled) {
+      // Turning a link off rotates its token, so an old copy of the URL can never come back to life.
+      db.prepare('UPDATE conversations SET public_token = ? WHERE id = ?').run(generateToken(), convId);
+    }
   }
 
   if (snoozed_until !== undefined) {
