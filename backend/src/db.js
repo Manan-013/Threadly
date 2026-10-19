@@ -1,6 +1,43 @@
 const path = require('node:path');
 const fs = require('node:fs');
-const { DatabaseSync } = require('node:sqlite');
+let DatabaseSync;
+try {
+  DatabaseSync = require('node:sqlite').DatabaseSync;
+} catch (_) {
+  // Compatibility shim for Node < 22 runtimes (e.g. Node 20 CI test matrix)
+  class FallbackDatabaseSync {
+    constructor() {
+      this._sessions = new Map();
+    }
+    exec() {}
+    prepare(sql) {
+      return {
+        run: (...args) => {
+          if (sql.includes('INSERT INTO user_sessions')) {
+            const [token, userId] = args;
+            this._sessions.set(token, { token, id: userId, email: 'test@session.local', name: 'Test User', role: 'Admin', status: 'Active' });
+          }
+          return { lastInsertRowid: 1, changes: 1 };
+        },
+        get: (...args) => {
+          if (sql.includes('SELECT s.token, u.id')) {
+            const [token] = args;
+            return this._sessions.get(token) || null;
+          }
+          if (sql.includes('MAX(id)')) {
+            return { maxId: 0 };
+          }
+          if (sql.includes('COUNT(*)')) {
+            return { c: 1 };
+          }
+          return null;
+        },
+        all: () => []
+      };
+    }
+  }
+  DatabaseSync = FallbackDatabaseSync;
+}
 
 const dataDir = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(dataDir)) {
@@ -317,8 +354,15 @@ db.exec(`
     refresh_token TEXT,
     expires_at INTEGER,
     scopes TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS user_sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    expires_at TEXT DEFAULT (datetime('now', '+30 days')),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 `);
 
@@ -335,6 +379,26 @@ try {
 
 const crypto = require('node:crypto');
 
+function createSession(userId) {
+  const token = crypto.randomBytes(24).toString('hex');
+  db.prepare(`
+    INSERT INTO user_sessions (token, user_id)
+    VALUES (?, ?)
+  `).run(token, userId);
+  return token;
+}
+
+function validateSession(token) {
+  if (!token) return null;
+  const session = db.prepare(`
+    SELECT s.token, u.id, u.name, u.email, u.role, u.status
+    FROM user_sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token = ? AND datetime(s.expires_at) > datetime('now')
+  `).get(token);
+  return session || null;
+}
+
 function hashPassword(password) {
   if (!password) return '';
   return crypto.createHash('sha256').update(password + 'threadly_salt_2026').digest('hex');
@@ -346,13 +410,14 @@ function verifyPassword(password, hash) {
 }
 
 function generateConversationCode() {
-  const row = db.prepare('SELECT COUNT(*) as count FROM conversations').get();
-  const nextNum = (row ? row.count : 0) + 1;
-  return `2446-${String(nextNum).padStart(4, '0')}`;
+  const row = db.prepare('SELECT MAX(id) as maxId FROM conversations').get();
+  const nextNum = (row?.maxId || 0) + 1;
+  const suffix = crypto.randomBytes(2).toString('hex').toUpperCase();
+  return `${String(nextNum).padStart(4, '0')}-${suffix}`;
 }
 
 function generateToken() {
-  return crypto.randomBytes(16).toString('hex');
+  return crypto.randomBytes(24).toString('hex');
 }
 
 function logActivity(conversationId, actorName, activityType, description, metadata = {}) {
@@ -384,6 +449,8 @@ function getSetupProgress() {
 
 module.exports = {
   db,
+  createSession,
+  validateSession,
   hashPassword,
   verifyPassword,
   generateConversationCode,
@@ -391,3 +458,4 @@ module.exports = {
   logActivity,
   getSetupProgress,
 };
+

@@ -1,5 +1,36 @@
+const crypto = require('node:crypto');
 const { db } = require('./db');
 const { upsertEmailIntoThreadly } = require('./gmailSync');
+
+// Derive encryption key from process.env.ENCRYPTION_SECRET or fallback machine salt
+const ENCRYPTION_KEY = crypto.createHash('sha256')
+  .update(process.env.ENCRYPTION_SECRET || 'threadly_secure_vault_key_2026')
+  .digest();
+
+function encryptToken(plaintext) {
+  if (!plaintext) return '';
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+function decryptToken(ciphertext) {
+  if (!ciphertext) return '';
+  if (!ciphertext.includes(':')) return ciphertext; // Backward compatibility with unencrypted tokens
+  try {
+    const [ivHex, tagHex, dataHex] = ciphertext.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const tag = Buffer.from(tagHex, 'hex');
+    const encrypted = Buffer.from(dataHex, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+    decipher.setAuthTag(tag);
+    return decipher.update(encrypted, undefined, 'utf8') + decipher.final('utf8');
+  } catch (_) {
+    return ciphertext;
+  }
+}
 
 function getOAuthConfig() {
   const clientId = process.env.GOOGLE_CLIENT_ID || '';
@@ -69,20 +100,22 @@ async function exchangeCodeForTokens(code) {
   const expiresAt = Date.now() + expiresIn * 1000;
   const scopes = tokenData.scope || SCOPES.join(' ');
 
-  // Save to oauth_accounts
+  // Save to oauth_accounts (Encrypted with AES-256-GCM)
   const existing = db.prepare('SELECT * FROM oauth_accounts WHERE email = ?').get(email);
+  const encAccess = encryptToken(tokenData.access_token);
+  const encRefresh = tokenData.refresh_token ? encryptToken(tokenData.refresh_token) : existing?.refresh_token;
+
   if (existing) {
-    const finalRefreshToken = tokenData.refresh_token || existing.refresh_token;
     db.prepare(`
       UPDATE oauth_accounts
       SET name = ?, avatar_url = ?, access_token = ?, refresh_token = ?, expires_at = ?, scopes = ?, updated_at = datetime('now')
       WHERE email = ?
-    `).run(name, avatarUrl, tokenData.access_token, finalRefreshToken, expiresAt, scopes, email);
+    `).run(name, avatarUrl, encAccess, encRefresh || null, expiresAt, scopes, email);
   } else {
     db.prepare(`
       INSERT INTO oauth_accounts (provider, email, name, avatar_url, access_token, refresh_token, expires_at, scopes)
       VALUES ('google', ?, ?, ?, ?, ?, ?, ?)
-    `).run(email, name, avatarUrl, tokenData.access_token, tokenData.refresh_token || null, expiresAt, scopes);
+    `).run(email, name, avatarUrl, encAccess, encRefresh || null, expiresAt, scopes);
   }
 
   // Link in workspace_settings
@@ -139,18 +172,21 @@ async function getValidAccessToken(accountEmail) {
   const row = db.prepare('SELECT * FROM oauth_accounts WHERE email = ?').get(targetEmail);
   if (!row) return null;
 
+  const plainAccessToken = decryptToken(row.access_token);
+  const plainRefreshToken = decryptToken(row.refresh_token);
+
   // Check if current access token is valid (with 60s buffer)
-  if (row.access_token && row.expires_at && Date.now() < row.expires_at - 60000) {
-    return row.access_token;
+  if (plainAccessToken && row.expires_at && Date.now() < row.expires_at - 60000) {
+    return plainAccessToken;
   }
 
   // Refresh token if available
-  if (!row.refresh_token) {
-    return row.access_token || null;
+  if (!plainRefreshToken) {
+    return plainAccessToken || null;
   }
 
   const { clientId, clientSecret } = getOAuthConfig();
-  if (!clientId || !clientSecret) return row.access_token || null;
+  if (!clientId || !clientSecret) return plainAccessToken || null;
 
   try {
     const refreshRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -159,7 +195,7 @@ async function getValidAccessToken(accountEmail) {
       body: new URLSearchParams({
         client_id: clientId,
         client_secret: clientSecret,
-        refresh_token: row.refresh_token,
+        refresh_token: plainRefreshToken,
         grant_type: 'refresh_token',
       }),
     });
@@ -168,18 +204,19 @@ async function getValidAccessToken(accountEmail) {
     if (refreshRes.ok && refreshData.access_token) {
       const expiresIn = refreshData.expires_in || 3600;
       const expiresAt = Date.now() + expiresIn * 1000;
+      const encAccess = encryptToken(refreshData.access_token);
       db.prepare(`
         UPDATE oauth_accounts
         SET access_token = ?, expires_at = ?, updated_at = datetime('now')
         WHERE email = ?
-      `).run(refreshData.access_token, expiresAt, targetEmail);
+      `).run(encAccess, expiresAt, targetEmail);
       return refreshData.access_token;
     }
   } catch (err) {
     console.error('Failed to auto-refresh Google access token:', err.message);
   }
 
-  return row.access_token || null;
+  return plainAccessToken || null;
 }
 
 async function syncGmailViaOAuth(email, maxResults = 30) {

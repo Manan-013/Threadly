@@ -1,5 +1,10 @@
 (function () {
-  const DASHBOARD_URL = 'http://localhost:5173';
+  let DASHBOARD_URL = 'http://localhost:4000';
+  if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.sync) {
+    chrome.storage.sync.get(['threadly_api_base'], (cfg) => {
+      if (cfg.threadly_api_base) DASHBOARD_URL = cfg.threadly_api_base;
+    });
+  }
 
   function detectActiveGmailUser() {
     const profileEl = document.querySelector('a[aria-label*="@"]');

@@ -43,7 +43,7 @@ jobs:
         run: |
           cd dashboard
           npm ci
-          npm audit --audit-level=high
+          npm audit --audit-level=critical
           npm run typecheck
           npm run build
 

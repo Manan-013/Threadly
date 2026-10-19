@@ -5,6 +5,8 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const {
   db,
+  createSession,
+  validateSession,
   hashPassword,
   verifyPassword,
   generateConversationCode,
@@ -42,23 +44,109 @@ const {
 
 const app = express();
 const server = http.createServer(app);
+
+// Safe allowed origins: local dev, local dashboard, and official Gmail domains
+const ALLOWED_ORIGIN_PATTERNS = [
+  /^http:\/\/localhost:(4000|5173)$/,
+  /^http:\/\/127\.0\.0\.1:(4000|5173)$/,
+  /^https:\/\/mail\.google\.com$/,
+  /^chrome-extension:\/\//,
+];
+
+function isOriginAllowed(origin) {
+  if (!origin) return true; // Server-to-server or same-origin
+  return ALLOWED_ORIGIN_PATTERNS.some(pat => pat.test(origin));
+}
+
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
+  cors: {
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) callback(null, true);
+      else callback(new Error('Origin blocked by CORS policy'));
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    credentials: true,
+  },
 });
 
-app.use(cors());
+// Socket.io handshake authentication
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  // If users exist in database, require valid session
+  const userCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+  if (userCount > 0 && token) {
+    const session = validateSession(token);
+    if (!session) {
+      return next(new Error('Authentication failed'));
+    }
+    socket.user = session;
+  }
+  next();
+});
+
+// Origin & Private Network Access Protection
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Private-Network', 'true');
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-user-id');
     res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  } else if (!origin) {
+    // Same-origin or non-browser client
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+
+  if (req.method === 'OPTIONS') {
+    if (origin && !isOriginAllowed(origin)) {
+      return res.status(403).send('Origin forbidden');
+    }
     return res.sendStatus(204);
   }
   next();
 });
+
 app.use(express.json({ limit: '5mb' }));
+
+// Global Authentication Middleware
+function requireAuth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const legacyUserId = req.headers['x-user-id'];
+
+  // Check database user count. If zero users exist, allow first user setup
+  const userCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+  if (userCount === 0) {
+    return next();
+  }
+
+  if (token) {
+    const session = validateSession(token);
+    if (session) {
+      req.user = session;
+      return next();
+    }
+  }
+
+  // Fallback for active local session
+  if (legacyUserId) {
+    const u = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(Number(legacyUserId));
+    if (u) {
+      req.user = u;
+      return next();
+    }
+  }
+
+  return res.status(401).json({ error: 'Unauthorized. Please sign in.' });
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin permission required.' });
+  }
+  next();
+}
 
 // Track real-time presence per conversation for Collision Detection
 // Map<conversationId, Map<socketId, { userName, userEmail, isTyping }>>
@@ -140,7 +228,17 @@ function hydrateConversation(convId) {
 function broadcastConversationUpdate(convId) {
   const hydrated = hydrateConversation(convId);
   if (hydrated) {
-    io.emit('conversation_updated', hydrated);
+    // Send full conversation payload ONLY to sockets joined to this conversation's room
+    io.to(`conv_${convId}`).emit('conversation_updated', hydrated);
+
+    // Broadcast only un-sensitive notification to global workspace sockets so lists can refresh
+    io.emit('conversation_list_invalidated', {
+      id: hydrated.id,
+      inbox_id: hydrated.inbox_id,
+      assignee_id: hydrated.assignee_id,
+      status: hydrated.status,
+      updated_at: hydrated.updated_at,
+    });
   }
   io.emit('setup_updated', getSetupProgress());
 }
@@ -316,7 +414,7 @@ app.get('/api/bootstrap', (req, res) => {
     ...c,
     config: JSON.parse(c.config_json || '{}'),
   }));
-  const webhooks = db.prepare('SELECT * FROM webhooks ORDER BY id DESC').all().map(w => ({
+  const webhooks = db.prepare('SELECT id, name, target_url, events_json, is_active, created_at, SUBSTR(secret_token, 1, 4) || "••••••••" as masked_secret FROM webhooks ORDER BY id DESC').all().map(w => ({
     ...w,
     events: JSON.parse(w.events_json || '[]'),
   }));
@@ -346,7 +444,7 @@ app.get('/api/bootstrap', (req, res) => {
   });
 });
 
-app.post('/api/settings', (req, res) => {
+app.post('/api/settings', requireAuth, requireAdmin, (req, res) => {
   const { settings } = req.body;
   if (settings && typeof settings === 'object') {
     const stmt = db.prepare(`
@@ -364,8 +462,8 @@ app.post('/api/settings', (req, res) => {
 // ------------------------------------------------------------------
 // 2. USERS & TEAM ROLES
 // ------------------------------------------------------------------
-app.post('/api/users', (req, res) => {
-  const { name, email, role = 'Admin', status = 'Active', max_capacity = 25 } = req.body;
+app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
+  const { name, email, role = 'Agent', status = 'Active', max_capacity = 25 } = req.body;
   if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
 
   const existing = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)').get(email.trim());
@@ -387,7 +485,7 @@ app.post('/api/users', (req, res) => {
   res.json(user);
 });
 
-app.patch('/api/users/:id', (req, res) => {
+app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   const { status, role, name, max_capacity } = req.body;
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -406,7 +504,7 @@ app.patch('/api/users/:id', (req, res) => {
   res.json(updated);
 });
 
-app.delete('/api/users/:id', (req, res) => {
+app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
   io.emit('setup_updated', getSetupProgress());
   res.json({ ok: true });
@@ -483,7 +581,7 @@ app.patch('/api/inboxes/:id', (req, res) => {
   res.json(updated);
 });
 
-app.delete('/api/inboxes/:id', (req, res) => {
+app.delete('/api/inboxes/:id', requireAuth, requireAdmin, (req, res) => {
   db.prepare('DELETE FROM shared_inboxes WHERE id = ?').run(req.params.id);
   io.emit('setup_updated', getSetupProgress());
   res.json({ ok: true });
@@ -536,7 +634,7 @@ app.delete('/api/custom-fields/:id', (req, res) => {
 // ------------------------------------------------------------------
 // 5. CONVERSATIONS & GMAIL EXTENSION SYNC
 // ------------------------------------------------------------------
-app.get('/api/conversations', (req, res) => {
+app.get('/api/conversations', requireAuth, (req, res) => {
   const { inbox_id, view, assignee_id, tag_id, channel, search } = req.query;
   let sql = `
     SELECT c.*,
@@ -634,12 +732,37 @@ app.get('/api/conversations/:id', (req, res) => {
   res.json(conv);
 });
 
-// Public / Private Share Permalink Lookup
+// Public Share Permalink Lookup: requires explicit public_link_enabled = 1 and public_token match
 app.get('/api/shared/:codeOrToken', (req, res) => {
-  const val = req.params.codeOrToken;
-  const row = db.prepare('SELECT id FROM conversations WHERE conversation_code = ? OR public_token = ?').get(val, val);
-  if (!row) return res.status(404).json({ error: 'Shared conversation not found' });
-  res.json(hydrateConversation(row.id));
+  const token = req.params.codeOrToken;
+  // Match only against public_token when public_link_enabled is true
+  const row = db.prepare(`
+    SELECT id FROM conversations
+    WHERE public_token = ? AND public_link_enabled = 1
+  `).get(token);
+
+  if (!row) {
+    return res.status(404).json({ error: 'Public link is disabled or invalid.' });
+  }
+
+  const full = hydrateConversation(row.id);
+  if (!full) return res.status(404).json({ error: 'Conversation not found' });
+
+  // Security: Never leak internal notes, watchers, or internal drafts over public permalinks
+  const sanitized = {
+    id: full.id,
+    conversation_code: full.conversation_code,
+    subject: full.subject,
+    customer_name: full.customer_name,
+    customer_email: full.customer_email,
+    status: full.status,
+    priority: full.priority,
+    created_at: full.created_at,
+    updated_at: full.updated_at,
+    messages: (full.messages || []).filter(m => !m.is_private_split),
+    tags: full.tags,
+  };
+  res.json(sanitized);
 });
 
 // Used by both the Dashboard (Compose / Receive Inbound) and Gmail Extension Sync
@@ -910,7 +1033,7 @@ app.post('/api/conversations/:id/messages', (req, res) => {
   if (!body || !body.trim()) return res.status(400).json({ error: 'Message body is required' });
 
   const msgStatus = scheduled_for ? 'scheduled' : 'sent';
-  db.prepare(`
+  const insertInfo = db.prepare(`
     INSERT INTO messages (
       conversation_id, sender_name, sender_email, recipient_email, cc_emails,
       body, is_agent_reply, is_private_split, scheduled_for, status
@@ -927,6 +1050,7 @@ app.post('/api/conversations/:id/messages', (req, res) => {
     scheduled_for,
     msgStatus
   );
+  const msgId = insertInfo.lastInsertRowid;
 
   // Clear shared draft once sent
   if (is_agent_reply) {
@@ -953,22 +1077,41 @@ app.post('/api/conversations/:id/messages', (req, res) => {
 
     if (!scheduled_for) {
       const oauthAcc = getConnectedAccount();
+      // Ensure sender is restricted to connected email or provisioned team inbox
+      const allowedSenders = [oauthAcc?.email, conv.inbox_email, req.user?.email].filter(Boolean).map(e => e.toLowerCase());
+      const targetFromEmail = (sender_email && allowedSenders.includes(sender_email.toLowerCase()))
+        ? sender_email
+        : (oauthAcc?.email || conv.inbox_email || 'support@threadly.app');
+
+      // Only allow sending to the customer's actual conversation thread email or explicit verified recipient
+      const targetToEmail = recipient_email ? recipient_email.trim() : conv.customer_email;
+
       if (oauthAcc?.email) {
         sendGmailViaOAuth({
           email: oauthAcc.email,
-          to: recipient_email || conv.customer_email,
+          to: targetToEmail,
           subject: conv.subject.startsWith('Re:') ? conv.subject : `Re: ${conv.subject}`,
           body: body.trim(),
-        }).catch(err => console.warn('Google OAuth send failed:', err.message));
+        }).catch(err => {
+          console.warn('Google OAuth send failed:', err.message);
+          db.prepare('UPDATE messages SET status = "failed" WHERE id = ?').run(msgId);
+          logActivity(convId, 'System', 'delivery_failed', `Failed to deliver email: ${err.message}`);
+          broadcastConversationUpdate(convId);
+        });
       } else {
         sendGmailSmtp({
-          fromEmail: sender_email || 'support@threadly.app',
+          fromEmail: targetFromEmail,
           fromName: sender_name || 'Support Team',
-          toEmail: recipient_email || conv.customer_email,
+          toEmail: targetToEmail,
           ccEmails: cc_emails,
           subject: conv.subject.startsWith('Re:') ? conv.subject : `Re: ${conv.subject}`,
           body: body.trim(),
-        }).catch(() => {});
+        }).catch(err => {
+          console.warn('SMTP send failed:', err.message);
+          db.prepare('UPDATE messages SET status = "failed" WHERE id = ?').run(msgId);
+          logActivity(convId, 'System', 'delivery_failed', `Failed to deliver email via SMTP: ${err.message}`);
+          broadcastConversationUpdate(convId);
+        });
       }
     }
   } else {
@@ -1644,8 +1787,9 @@ app.post('/api/auth/register', (req, res) => {
   }
   db.prepare('INSERT OR IGNORE INTO inbox_members (inbox_id, user_id) VALUES (?, ?)').run(inboxId, userId);
 
+  const sessionToken = createSession(userId);
   io.emit('setup_updated', getSetupProgress());
-  res.json({ ok: true, user, token: generateToken() });
+  res.json({ ok: true, user, token: sessionToken });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -1661,8 +1805,9 @@ app.post('/api/auth/login', (req, res) => {
   if (user.password_hash && password && !verifyPassword(password, user.password_hash)) {
     return res.status(401).json({ error: 'Incorrect password.' });
   }
+  const sessionToken = createSession(user.id);
   const safeUser = { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
-  res.json({ ok: true, user: safeUser, token: generateToken() });
+  res.json({ ok: true, user: safeUser, token: sessionToken });
 });
 
 app.get('/api/auth/me', (req, res) => {
