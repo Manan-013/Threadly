@@ -44,16 +44,54 @@ function bool(value, fallback) {
   return /^(1|true|yes|on)$/i.test(value);
 }
 
+/**
+ * ALLOWED_ORIGINS: comma-separated exact origins that may call the API from a browser,
+ * e.g. "https://help.example.com,chrome-extension://<extension id>". Wildcards are rejected.
+ * When unset, only the local Vite dev server is allowed outside production.
+ */
+function parseOrigins(raw) {
+  const origins = (raw || '').split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean);
+  for (const origin of origins) {
+    if (!/^[a-z][a-z0-9+.-]*:\/\/[^/\s*]+$/i.test(origin)) {
+      throw new Error(`ALLOWED_ORIGINS contains an invalid origin "${origin}". Use exact origins such as https://app.example.com (no wildcards, no paths).`);
+    }
+  }
+  return origins;
+}
+
+const DEV_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+const allowedOrigins = env.ALLOWED_ORIGINS ? parseOrigins(env.ALLOWED_ORIGINS) : (isProduction ? [] : DEV_ORIGINS);
+const dashboardUrl = (env.DASHBOARD_URL || 'http://localhost:5173').replace(/\/$/, '');
+
+// Host header allowlist (blocks DNS-rebinding against a locally bound server): loopback names plus
+// the hostnames of every configured origin, plus anything listed in ALLOWED_HOSTS.
+function hostnameOf(origin) {
+  const match = /^https?:\/\/(\[[^\]]+\]|[^/:]+)/i.exec(origin);
+  return match ? match[1].toLowerCase() : null;
+}
+const allowedHosts = new Set(['localhost', '127.0.0.1', '[::1]']);
+for (const o of [...allowedOrigins, dashboardUrl]) {
+  const h = hostnameOf(o);
+  if (h) allowedHosts.add(h);
+}
+for (const h of (env.ALLOWED_HOSTS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean)) allowedHosts.add(h);
+
 const config = {
   isProduction,
   dbPath,
+  port: Number(env.PORT) || 4000,
+  // Loopback by default: the API is not reachable from other machines unless you opt in with HOST=0.0.0.0.
+  host: env.HOST || '127.0.0.1',
+  allowedOrigins,
+  allowedHosts,
+  trustProxy: env.TRUST_PROXY || false,
   sessionSecret: resolveSecret('SESSION_SECRET', 32),
   sessionTtlHours: Number(env.SESSION_TTL_HOURS) > 0 ? Number(env.SESSION_TTL_HOURS) : 24 * 7,
   // Self-service sign-up. The first account always becomes the Admin; later sign-ups are Agents.
   // Set ALLOW_REGISTRATION=false once your team has accounts to require admin-created users.
   allowRegistration: bool(env.ALLOW_REGISTRATION, true),
   allowSeed: bool(env.ALLOW_SEED, !isProduction),
-  dashboardUrl: (env.DASHBOARD_URL || 'http://localhost:5173').replace(/\/$/, ''),
+  dashboardUrl,
 };
 
 module.exports = config;

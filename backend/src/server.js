@@ -29,6 +29,7 @@ const config = require('./config');
 const { createSession, validateSession, destroySession, destroySessionsForUser } = require('./services/sessions');
 const { requireAuth, requireAdmin, authGate } = require('./middleware/auth');
 const oauthState = require('./services/oauthState');
+const { hostGuard, corsMiddleware, socketAllowRequest, socketCorsOrigin } = require('./middleware/cors');
 const { seedWorkspaceData } = require('./seed');
 const {
   getSavedGmailCredentials,
@@ -50,27 +51,18 @@ const {
 const app = express();
 const server = http.createServer(app);
 
-// Safe allowed origins: local dev, local dashboard, and official Gmail domains
-const ALLOWED_ORIGIN_PATTERNS = [
-  /^http:\/\/localhost:(4000|5173)$/,
-  /^http:\/\/127\.0\.0\.1:(4000|5173)$/,
-  /^https:\/\/mail\.google\.com$/,
-  /^chrome-extension:\/\//,
-];
-
-function isOriginAllowed(origin) {
-  if (!origin) return true; // Server-to-server or same-origin
-  return ALLOWED_ORIGIN_PATTERNS.some(pat => pat.test(origin));
+if (config.trustProxy) {
+  // Needed for correct client IPs (rate limiting) behind a reverse proxy: TRUST_PROXY=1 or "loopback".
+  app.set('trust proxy', /^\d+$/.test(config.trustProxy) ? Number(config.trustProxy) : config.trustProxy);
 }
 
+// Browser access is limited to ALLOWED_ORIGINS (plus same-origin); see middleware/cors.js.
 const io = new Server(server, {
+  allowRequest: socketAllowRequest,
   cors: {
-    origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) callback(null, true);
-      else callback(new Error('Origin blocked by CORS policy'));
-    },
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    credentials: true,
+    origin: socketCorsOrigin,
+    methods: ['GET', 'POST'],
+    credentials: false,
   },
 });
 
@@ -85,28 +77,8 @@ io.use((socket, next) => {
   next();
 });
 
-// Origin & Private Network Access Protection
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && isOriginAllowed(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Private-Network', 'true');
-  } else if (!origin) {
-    // Same-origin or non-browser client
-    res.setHeader('Access-Control-Allow-Private-Network', 'true');
-  }
-
-  if (req.method === 'OPTIONS') {
-    if (origin && !isOriginAllowed(origin)) {
-      return res.status(403).send('Origin forbidden');
-    }
-    return res.sendStatus(204);
-  }
-  next();
-});
+app.use(hostGuard);
+app.use(corsMiddleware);
 
 app.use(express.json({ limit: '5mb' }));
 
@@ -2037,9 +2009,11 @@ if (fs.existsSync(dashboardDist)) {
 
 // Only bind a port when run directly (`node src/server.js`); tests import { app } instead.
 if (require.main === module) {
-  const PORT = process.env.PORT || 4000;
-  server.listen(PORT, () => {
-    console.log(`Threadly Unified Backend & Socket.io Server running on http://localhost:${PORT}`);
+  server.listen(config.port, config.host, () => {
+    console.log(`Threadly backend listening on http://${config.host}:${config.port}`);
+    if (config.host !== '127.0.0.1' && config.host !== 'localhost' && config.allowedOrigins.length === 0) {
+      console.warn('[config] HOST is not loopback and ALLOWED_ORIGINS is empty: only same-origin browser access will work.');
+    }
   });
   startBackgroundSync();
 }
