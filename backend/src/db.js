@@ -1,42 +1,13 @@
 const path = require('node:path');
 const fs = require('node:fs');
+// node:sqlite ships without a flag from Node 22.13 (see "engines" in package.json and .nvmrc).
+// There is deliberately no fallback: a fake database would let the server start and tests "pass"
+// while every query returns nothing.
 let DatabaseSync;
 try {
-  DatabaseSync = require('node:sqlite').DatabaseSync;
-} catch (_) {
-  // Compatibility shim for Node < 22 runtimes (e.g. Node 20 CI test matrix)
-  class FallbackDatabaseSync {
-    constructor() {
-      this._sessions = new Map();
-    }
-    exec() {}
-    prepare(sql) {
-      return {
-        run: (...args) => {
-          if (sql.includes('INSERT INTO user_sessions')) {
-            const [token, userId] = args;
-            this._sessions.set(token, { token, id: userId, email: 'test@session.local', name: 'Test User', role: 'Admin', status: 'Active' });
-          }
-          return { lastInsertRowid: 1, changes: 1 };
-        },
-        get: (...args) => {
-          if (sql.includes('SELECT s.token, u.id')) {
-            const [token] = args;
-            return this._sessions.get(token) || null;
-          }
-          if (sql.includes('MAX(id)')) {
-            return { maxId: 0 };
-          }
-          if (sql.includes('COUNT(*)')) {
-            return { c: 1 };
-          }
-          return null;
-        },
-        all: () => []
-      };
-    }
-  }
-  DatabaseSync = FallbackDatabaseSync;
+  ({ DatabaseSync } = require('node:sqlite'));
+} catch (err) {
+  throw new Error(`Threadly needs Node.js 22.13 or newer for the built-in node:sqlite module (running ${process.version}). ${err.message}`);
 }
 
 // config.dbPath: THREADLY_DB_PATH (':memory:' or a temp file in tests), default backend/data/threadly.sqlite
