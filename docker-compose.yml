@@ -1,0 +1,18 @@
+services:
+  threadly:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: threadly-server
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+      - NODE_ENV=production
+    volumes:
+      - threadly-data:/app/backend/data
+
+volumes:
+  threadly-data:
+    name: threadly-sqlite-data

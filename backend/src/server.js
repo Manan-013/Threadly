@@ -1792,7 +1792,23 @@ setInterval(async () => {
   }
 }, 60000);
 
+const path = require('node:path');
+const fs = require('node:fs');
+
+// In production, serve the compiled dashboard build
+const dashboardDist = path.join(__dirname, '../../dashboard/dist');
+if (fs.existsSync(dashboardDist)) {
+  app.use(express.static(dashboardDist));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
+      return next();
+    }
+    res.sendFile(path.join(dashboardDist, 'index.html'));
+  });
+}
+
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`Threadly Unified Backend & Socket.io Server running on http://localhost:${PORT}`);
 });
+

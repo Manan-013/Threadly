@@ -352,7 +352,7 @@ function generateConversationCode() {
 }
 
 function generateToken() {
-  return Math.random().toString(36).substring(2, 12) + Math.random().toString(36).substring(2, 12);
+  return crypto.randomBytes(16).toString('hex');
 }
 
 function logActivity(conversationId, actorName, activityType, description, metadata = {}) {

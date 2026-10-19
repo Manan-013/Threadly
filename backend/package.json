@@ -5,7 +5,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node --no-warnings src/server.js",
-    "dev": "node --no-warnings --watch src/server.js"
+    "dev": "node --no-warnings --watch src/server.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

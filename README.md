@@ -94,25 +94,47 @@ Traditional helpdesks like Zendesk, Front, and Intercom force support teams to a
 
 ---
 
-## Quickstart in 3 Minutes
+## Quickstart
 
-### Prerequisites
-- [Node.js](https://nodejs.org/) v18.0.0 or higher (Node 20+ recommended)
-- Google Chrome browser (or any Chromium browser: Brave, Edge, Arc)
-- `npm` or `yarn`
+You can run Threadly using **Docker Compose (Production, Recommended)** or **Local Development**.
 
-### 1. Clone the Repository
+### Option A: One-Command Docker Deployment (Production)
+
+Clone and run the unified stack (frontend + backend + persistent SQLite):
 ```bash
-git clone https://github.com/your-username/threadly.git
-cd threadly
+git clone https://github.com/Manan-013/Threadly.git
+cd Threadly
+docker compose up -d
 ```
+The full application runs on `http://localhost:4000`.
 
-### 2. Start the Real-Time Backend
+---
+
+### Option B: Local Development Setup
+
+#### Prerequisites
+- [Node.js](https://nodejs.org/) v20.x or v22.x LTS
+- Google Chrome (or any Chromium browser: Brave, Edge, Arc)
+- `npm` v10+
+
+#### 1. Start the Backend
 ```bash
 cd backend
 npm install
+npm test
 npm start
 ```
+
+#### 2. Start the Web Dashboard
+In a separate terminal:
+```bash
+cd dashboard
+npm install
+npm run typecheck
+npm run dev
+```
+Open [http://localhost:5173](http://localhost:5173) in your browser.
+*(In production, `npm run build` in `dashboard/` allows `backend` to serve the entire app directly on port 4000 without Vite).*
 *The backend boots on `http://localhost:4000` with an auto-initialized SQLite database at `backend/data/threadly.sqlite`.*
 
 ### 3. Start the Web Dashboard

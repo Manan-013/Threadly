@@ -36,17 +36,23 @@ We are committed to providing a welcoming, inclusive, and harassment-free enviro
    cd backend && npm install
    cd ../dashboard && npm install
    ```
-4. **Make your changes** and test locally.
-5. **Verify the dashboard build**:
+4. **Make your changes** and run test suites:
    ```bash
-   cd dashboard
-   npm run build
+   # Run backend unit tests
+   cd backend && npm test
+
+   # Run extension validation tests
+   cd ../extension && npm test
+
+   # Run dashboard typecheck & production build
+   cd ../dashboard && npm run typecheck && npm run build
    ```
-6. **Commit your changes** using descriptive commit messages:
+5. **Commit your changes** using descriptive commit messages:
    ```bash
    git commit -m "feat(extension): add support for dark mode toggle in Gmail sidecar"
    ```
-7. **Push to your fork** and submit a **Pull Request** against the `main` branch.
+6. **Push to your fork** and submit a **Pull Request** against the `main` branch.
+   *GitHub Actions CI will automatically run all unit tests, typechecks, builds, and security audits across Node 20 and Node 22.*
 
 ---
 

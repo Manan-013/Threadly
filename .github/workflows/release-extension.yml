@@ -1,0 +1,41 @@
+name: Release Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  package-extension:
+    name: Package & Release Chrome Extension
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Validate Extension Manifest
+        run: |
+          cd extension
+          npm test
+
+      - name: Build Extension Artifact
+        run: |
+          mkdir -p release
+          cd extension
+          zip -r ../release/threadly-chrome-extension-${{ github.ref_name }}.zip . -x "test/*" "package*.json"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true

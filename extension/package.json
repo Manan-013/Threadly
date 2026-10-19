@@ -1,0 +1,9 @@
+{
+  "name": "threadly-extension",
+  "version": "1.1.0",
+  "description": "Chrome Manifest V3 Extension for Threadly Gmail Integration",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

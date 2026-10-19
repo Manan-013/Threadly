@@ -332,6 +332,7 @@ function generateSmartReply(conversationId, mode = 'professional', customPrompt 
 }
 
 module.exports = {
+  evaluateCondition,
   applySlaPolicies,
   evaluateAutomations,
   runAutoAssignment,
@@ -340,3 +341,4 @@ module.exports = {
   generateAiSummary,
   generateSmartReply,
 };
+

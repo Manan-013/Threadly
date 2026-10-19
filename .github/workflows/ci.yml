@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    name: Test & Build (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x, 22.x]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            dashboard/package-lock.json
+
+      - name: Backend - Install, Audit & Test
+        run: |
+          cd backend
+          npm ci
+          npm audit --audit-level=high
+          npm test
+
+      - name: Extension - Install & Validate
+        run: |
+          cd extension
+          npm test
+
+      - name: Dashboard - Install, Typecheck & Production Build
+        run: |
+          cd dashboard
+          npm ci
+          npm audit --audit-level=high
+          npm run typecheck
+          npm run build
+
+      - name: Security - Check for Leaked Secrets
+        run: |
+          if git grep -i -E "ghp_[0-9a-zA-Z]{36}|AIza[0-9A-Za-z_-]{35}" -- ':(exclude)*.ttf' ':(exclude)*.lock'; then
+            echo "Potential secret pattern detected!"
+            exit 1
+          fi
+          echo "Secret check clean."
