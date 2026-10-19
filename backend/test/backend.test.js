@@ -18,22 +18,6 @@ test('Conversation Code Generation', () => {
   assert.match(code, /^\d{4}-[0-9A-F]{4}$/, 'Code must match XXXX-XXXX hex suffix format');
 });
 
-test('Session Management', () => {
-  const { db, createSession, validateSession } = require('../src/db');
-  db.prepare("INSERT OR IGNORE INTO users (id, name, email, role, status) VALUES (999, 'Test User', 'test@session.local', 'Admin', 'Active')").run();
-  const token = createSession(999);
-  assert.equal(typeof token, 'string');
-  assert.equal(token.length, 48);
-
-  const session = validateSession(token);
-  assert.ok(session, 'Valid session should return session object');
-  assert.equal(session.id, 999);
-  assert.equal(session.email, 'test@session.local');
-
-  const invalid = validateSession('invalid-token-1234');
-  assert.equal(invalid, null, 'Invalid token must return null');
-});
-
 test('Sentiment Analysis Engine', () => {
   const positive = analyzeSentiment('Thank you so much, this is great helpful service!');
   const negative = analyzeSentiment('This is urgent, broken, terrible and issue!');

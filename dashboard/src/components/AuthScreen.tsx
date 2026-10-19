@@ -25,6 +25,14 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       setError('Please enter your full name.');
       return;
     }
+    if (!password) {
+      setError('Please enter your password.');
+      return;
+    }
+    if (mode === 'register' && password.length < 10) {
+      setError('Choose a password with at least 10 characters.');
+      return;
+    }
 
     setLoading(true);
     try {
@@ -42,8 +50,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       if (!res.ok) {
         setError(data.error || 'Authentication failed. Please try again.');
       } else {
-        localStorage.setItem('threadly_active_user_id', String(data.user.id));
-        localStorage.removeItem('threadly_logged_out');
         onAuthenticated(data.user, data.token);
       }
     } catch (err: any) {
@@ -161,7 +167,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                   type="password"
                   value={password}
                   onChange={e => setPassword(e.target.value)}
-                  placeholder={mode === 'register' ? 'Create a secure password' : 'Enter your password'}
+                  placeholder={mode === 'register' ? 'At least 10 characters' : 'Enter your password'}
+                  minLength={mode === 'register' ? 10 : undefined}
                   className="w-full pl-9 pr-3 py-2 border border-[#CBD5E1] rounded-xl text-xs focus:outline-none focus:border-[#DC2626] transition-colors"
                   autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
                 />

@@ -57,6 +57,7 @@ import {
   NewConversationModal,
 } from './components/ConversationModals';
 import { AuthScreen } from './components/AuthScreen';
+import { SharedThreadView } from './components/SharedThreadView';
 
 export const App: React.FC = () => {
   const [bootstrap, setBootstrap] = useState<any>({
@@ -77,10 +78,12 @@ export const App: React.FC = () => {
   });
 
   // Current operator state
-  const [activeUserId, setActiveUserId] = useState<number | null>(() => {
-    const saved = localStorage.getItem('threadly_active_user_id');
-    return saved ? Number(saved) : null;
-  });
+  // `me` is the authenticated user (from the session token). `activeUserId` is only the
+  // assignee filter used by the "Mine" / "Team" views; it is never used as an identity.
+  const [me, setMe] = useState<any | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [activeUserId, setActiveUserId] = useState<number | null>(null);
+  const sharedToken = new URLSearchParams(window.location.search).get('shared');
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [operatorStatus, setOperatorStatus] = useState<'Active' | 'Away' | 'Offline'>('Active');
   const [showStatusDropdown, setShowStatusDropdown] = useState(false);
@@ -166,28 +169,54 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isEmbedded]);
 
-  const currentUser = activeUserId !== null
-    ? bootstrap.users.find((u: any) => u.id === activeUserId) || null
-    : null;
+  const currentUser = me ? bootstrap.users.find((u: any) => u.id === me.id) || me : null;
   const currentUserName = currentUser ? currentUser.name : 'Guest';
+  const isAdmin = me?.role === 'Admin';
 
-  const handleSelectUser = (id: number) => {
-    setActiveUserId(id);
-    localStorage.setItem('threadly_active_user_id', String(id));
-    localStorage.removeItem('threadly_logged_out');
-    setShowUserMenu(false);
-  };
+  // Resolve the session once on load; a missing/expired token falls through to the login screen.
+  useEffect(() => {
+    const token = localStorage.getItem('threadly_auth_token');
+    if (!token) {
+      setAuthChecked(true);
+      return;
+    }
+    fetch('/api/auth/me')
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (data?.user) {
+          setMe(data.user);
+          setActiveUserId(data.user.id);
+        } else {
+          localStorage.removeItem('threadly_auth_token');
+        }
+      })
+      .catch(() => {})
+      .finally(() => setAuthChecked(true));
+  }, []);
 
-  const handleLogout = () => {
-    setActiveUserId(null);
-    localStorage.removeItem('threadly_active_user_id');
+  // main.tsx dispatches this when the API answers 401 (expired or revoked session).
+  useEffect(() => {
+    const onUnauthorized = () => {
+      setMe(null);
+      setActiveUserId(null);
+    };
+    window.addEventListener('threadly:unauthorized', onUnauthorized);
+    return () => window.removeEventListener('threadly:unauthorized', onUnauthorized);
+  }, []);
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (_) {
+      // Offline: the token is still discarded locally below.
+    }
     localStorage.removeItem('threadly_auth_token');
-    localStorage.setItem('threadly_logged_out', '1');
-    setShowUserMenu(false);
+    window.location.reload(); // drops every in-memory conversation of the previous user
   };
 
   const fetchBootstrap = async () => {
     const res = await fetch('/api/bootstrap');
+    if (!res.ok) return;
     const data = await res.json();
     setBootstrap(data);
     const params = new URLSearchParams(window.location.search);
@@ -195,10 +224,6 @@ export const App: React.FC = () => {
     const urlInbox = params.get('inbox_id');
     if (urlAssignee) {
       setActiveUserId(Number(urlAssignee));
-      localStorage.setItem('threadly_active_user_id', urlAssignee);
-    } else if (activeUserId === null && !localStorage.getItem('threadly_logged_out') && data.users.length > 0) {
-      setActiveUserId(data.users[0].id);
-      localStorage.setItem('threadly_active_user_id', String(data.users[0].id));
     }
     if (urlInbox) {
       setSelectedInboxId(Number(urlInbox));
@@ -219,6 +244,7 @@ export const App: React.FC = () => {
     if (searchQuery.trim()) params.set('search', searchQuery.trim());
 
     const res = await fetch(`/api/conversations?${params.toString()}`);
+    if (!res.ok) return;
     const list = await res.json();
     setConversations(list);
   };
@@ -237,15 +263,12 @@ export const App: React.FC = () => {
     setComposeOpen(true);
 
     if (socketRef.current) {
-      socketRef.current.emit('join_conversation', {
-        conversationId: full.id,
-        userName: currentUserName,
-        userEmail: currentUser?.email || '',
-      });
+      socketRef.current.emit('join_conversation', { conversationId: full.id });
     }
   };
 
   useEffect(() => {
+    if (!me) return;
     const params = new URLSearchParams(window.location.search);
     const urlView = params.get('view');
     const urlInbox = params.get('inbox_id');
@@ -281,20 +304,15 @@ export const App: React.FC = () => {
     };
     fetchOAuthStatus();
 
-    const urlUserId = params.get('user_id');
     if (params.get('auth_success')) {
-      if (urlUserId) {
-        setActiveUserId(Number(urlUserId));
-        localStorage.setItem('threadly_active_user_id', urlUserId);
-        localStorage.removeItem('threadly_logged_out');
-      }
       setShowGmailSyncModal(true);
       window.history.replaceState({}, document.title, window.location.pathname);
     }
 
-    const sharedCodeOrToken = params.get('thread') || params.get('shared');
-    if (sharedCodeOrToken) {
-      fetch(`/api/shared/${encodeURIComponent(sharedCodeOrToken)}`)
+    // Internal permalink (?thread=<conversation code>): requires the signed-in user's session.
+    const threadCode = params.get('thread');
+    if (threadCode) {
+      fetch(`/api/conversations/by-code/${encodeURIComponent(threadCode)}`)
         .then(r => (r.ok ? r.json() : null))
         .then(conv => {
           if (conv && conv.id) openConversation(conv.id);
@@ -306,6 +324,12 @@ export const App: React.FC = () => {
       auth: { token },
     });
     socketRef.current = socket;
+
+    socket.on('connect_error', err => {
+      if (err.message === 'Authentication failed') {
+        window.dispatchEvent(new Event('threadly:unauthorized'));
+      }
+    });
 
     socket.on('oauth_connected', () => {
       fetchOAuthStatus();
@@ -357,11 +381,11 @@ export const App: React.FC = () => {
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [me?.id]);
 
   useEffect(() => {
-    fetchConversations();
-  }, [selectedInboxId, selectedView, selectedTagId, channelFilter, searchQuery, activeUserId]);
+    if (me) fetchConversations();
+  }, [me?.id, selectedInboxId, selectedView, selectedTagId, channelFilter, searchQuery, activeUserId]);
 
   const handleUpdateConversation = async (patch: any) => {
     if (!activeConversation) return;
@@ -527,16 +551,22 @@ export const App: React.FC = () => {
     (p: any) => p.socketId !== socketRef.current?.id
   );
 
+  // Public share links are read-only and need no account.
+  if (sharedToken) {
+    return <SharedThreadView token={sharedToken} />;
+  }
+
+  if (!authChecked) {
+    return <div className="min-h-screen bg-[#F8FAFC]" />;
+  }
+
   if (!currentUser) {
     return (
       <AuthScreen
         onAuthenticated={(user: any, token: string) => {
+          localStorage.setItem('threadly_auth_token', token);
+          setMe(user);
           setActiveUserId(user.id);
-          localStorage.setItem('threadly_active_user_id', String(user.id));
-          if (token) localStorage.setItem('threadly_auth_token', token);
-          localStorage.removeItem('threadly_logged_out');
-          fetchBootstrap();
-          fetchConversations();
         }}
       />
     );
@@ -842,19 +872,11 @@ export const App: React.FC = () => {
                 <span className="text-[11px] font-semibold text-[#0F172A]">{currentUser.name}</span>
                 <ChevronDown className="w-3.5 h-3.5 text-[#64748B]" />
               </button>
-            ) : (
-              <button
-                onClick={() => setShowUserMenu(!showUserMenu)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#DC2626] hover:bg-[#B91C1C] text-white text-[11px] font-semibold transition-colors shadow-sm"
-              >
-                <User className="w-3.5 h-3.5" />
-                <span>Sign In / Select User</span>
-              </button>
-            )}
+            ) : null}
 
             {showUserMenu && (
               <div className="threadly-popover-top-right absolute right-0 mt-2 w-64 bg-white border border-[#E2E8F0] rounded-xl shadow-xl py-2 z-50 text-xs">
-                {currentUser ? (
+                {currentUser && (
                   <>
                     {/* User Profile Card */}
                     <div className="px-3 py-2 border-b border-[#F1F5F9] flex items-center gap-3">
@@ -870,32 +892,6 @@ export const App: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Switch Team Member */}
-                    <div className="py-1">
-                      <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-[#94A3B8]">
-                        Switch Account
-                      </div>
-                      {bootstrap.users.map((u: any) => (
-                        <button
-                          key={u.id}
-                          onClick={() => handleSelectUser(u.id)}
-                          className={`w-full text-left px-3 py-1.5 flex items-center justify-between hover:bg-[#F8FAFC] transition-colors ${
-                            u.id === activeUserId ? 'font-bold text-[#DC2626]' : 'text-[#334155]'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2">
-                            <span className="w-5 h-5 rounded-full bg-[#F1F5F9] text-[9px] font-bold flex items-center justify-center">
-                              {u.name.slice(0, 2).toUpperCase()}
-                            </span>
-                            <span>{u.name}</span>
-                          </div>
-                          {u.id === activeUserId && (
-                            <span className="w-1.5 h-1.5 rounded-full bg-[#DC2626]"></span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-
                     <div className="my-1 border-t border-[#F1F5F9]" />
 
                     {/* Log Out Button */}
@@ -907,27 +903,6 @@ export const App: React.FC = () => {
                       <span>Log Out of Workspace</span>
                     </button>
                   </>
-                ) : (
-                  <div className="p-2 space-y-2">
-                    <div className="px-2 py-1 text-[11px] font-semibold text-[#0F172A]">
-                      Select an account to sign in:
-                    </div>
-                    {bootstrap.users.map((u: any) => (
-                      <button
-                        key={u.id}
-                        onClick={() => handleSelectUser(u.id)}
-                        className="w-full text-left p-2 rounded-lg hover:bg-[#F8FAFC] border border-[#E2E8F0] flex items-center gap-2.5 transition-colors"
-                      >
-                        <div className="w-7 h-7 rounded-full bg-[#DC2626] text-white text-[10px] font-bold flex items-center justify-center">
-                          {u.name.slice(0, 2).toUpperCase()}
-                        </div>
-                        <div>
-                          <div className="font-semibold text-[#0F172A] text-xs">{u.name}</div>
-                          <div className="text-[10px] text-[#64748B]">{u.email}</div>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
                 )}
               </div>
             )}

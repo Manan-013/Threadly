@@ -78,6 +78,8 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   const [userEmail, setUserEmail] = useState('');
   const [userRole, setUserRole] = useState('Agent');
   const [userCapacity, setUserCapacity] = useState(25);
+  const [userPassword, setUserPassword] = useState('');
+  const [userError, setUserError] = useState<string | null>(null);
 
   // Automation creation state
   const [ruleName, setRuleName] = useState('');
@@ -168,7 +170,8 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!userName.trim() || !userEmail.trim()) return;
-    await fetch('/api/users', {
+    setUserError(null);
+    const res = await fetch('/api/users', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -176,10 +179,18 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
         email: userEmail.trim(),
         role: userRole,
         max_capacity: userCapacity,
+        // Optional: without a password the person can be assigned conversations but cannot sign in.
+        ...(userPassword ? { password: userPassword } : {}),
       }),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setUserError(data.error || 'Could not save this user.');
+      return;
+    }
     setUserName('');
     setUserEmail('');
+    setUserPassword('');
     onRefreshBootstrap();
   };
 
@@ -1083,7 +1094,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
               onSubmit={handleCreateUser}
               className="grid grid-cols-12 gap-3 p-4 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg items-end"
             >
-              <div className="col-span-4">
+              <div className="col-span-3">
                 <label className="block text-[11px] font-medium text-[#475569] mb-1">
                   Full Name
                 </label>
@@ -1095,13 +1106,26 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
                   className="w-full border border-[#E2E8F0] bg-white rounded px-3 py-2 text-xs"
                 />
               </div>
-              <div className="col-span-4">
+              <div className="col-span-3">
                 <label className="block text-[11px] font-medium text-[#475569] mb-1">Email</label>
                 <input
                   type="email"
                   value={userEmail}
                   onChange={e => setUserEmail(e.target.value)}
                   placeholder="francesco@company.com"
+                  className="w-full border border-[#E2E8F0] bg-white rounded px-3 py-2 text-xs"
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="block text-[11px] font-medium text-[#475569] mb-1">
+                  Temporary password
+                </label>
+                <input
+                  type="password"
+                  value={userPassword}
+                  onChange={e => setUserPassword(e.target.value)}
+                  placeholder="min. 10 characters"
+                  autoComplete="new-password"
                   className="w-full border border-[#E2E8F0] bg-white rounded px-3 py-2 text-xs"
                 />
               </div>
@@ -1126,6 +1150,9 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
                   Add User
                 </button>
               </div>
+              {userError && (
+                <div className="col-span-12 text-[11px] text-[#991B1B]">{userError}</div>
+              )}
             </form>
 
             <div className="border border-[#E2E8F0] rounded-lg divide-y divide-[#E2E8F0]">

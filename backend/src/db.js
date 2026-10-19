@@ -39,8 +39,8 @@ try {
   DatabaseSync = FallbackDatabaseSync;
 }
 
-// THREADLY_DB_PATH lets tests use ':memory:' or a temp file; default is backend/data/threadly.sqlite
-const dbPath = process.env.THREADLY_DB_PATH || path.join(__dirname, '..', 'data', 'threadly.sqlite');
+// config.dbPath: THREADLY_DB_PATH (':memory:' or a temp file in tests), default backend/data/threadly.sqlite
+const { dbPath } = require('./config');
 if (dbPath !== ':memory:') {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 }
@@ -356,13 +356,25 @@ db.exec(`
     updated_at TEXT DEFAULT (datetime('now'))
   );
 
-  CREATE TABLE IF NOT EXISTS user_sessions (
-    token TEXT PRIMARY KEY,
+  -- Session tokens are never stored: only an HMAC of the token (see services/sessions.js).
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    expires_at TEXT DEFAULT (datetime('now', '+30 days')),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
+  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+  -- Legacy table that stored raw session tokens in plaintext; all old sessions are invalidated.
+  DROP TABLE IF EXISTS user_sessions;
+
+  -- Remove the fake "demo" Google account that the removed demo-login endpoint could create.
+  DELETE FROM workspace_settings
+    WHERE key = 'google_oauth_connected_email'
+      AND value IN (SELECT email FROM oauth_accounts WHERE access_token = 'demo_token');
+  DELETE FROM oauth_accounts WHERE access_token = 'demo_token';
 `);
 
 // Security: Purge any legacy raw app passwords from settings
@@ -377,26 +389,6 @@ try {
 } catch (_) {}
 
 const crypto = require('node:crypto');
-
-function createSession(userId) {
-  const token = crypto.randomBytes(24).toString('hex');
-  db.prepare(`
-    INSERT INTO user_sessions (token, user_id)
-    VALUES (?, ?)
-  `).run(token, userId);
-  return token;
-}
-
-function validateSession(token) {
-  if (!token) return null;
-  const session = db.prepare(`
-    SELECT s.token, u.id, u.name, u.email, u.role, u.status
-    FROM user_sessions s
-    JOIN users u ON u.id = s.user_id
-    WHERE s.token = ? AND datetime(s.expires_at) > datetime('now')
-  `).get(token);
-  return session || null;
-}
 
 function generateConversationCode() {
   const row = db.prepare('SELECT MAX(id) as maxId FROM conversations').get();
@@ -438,8 +430,6 @@ function getSetupProgress() {
 
 module.exports = {
   db,
-  createSession,
-  validateSession,
   generateConversationCode,
   generateToken,
   logActivity,

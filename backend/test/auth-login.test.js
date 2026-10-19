@@ -11,7 +11,7 @@ const legacyHash = pw => crypto.createHash('sha256').update(pw + 'threadly_salt_
 test('register then login with the correct password works', async () => {
   const reg = await request(app).post('/api/auth/register')
     .send({ name: 'Ada', email: 'ada@example.com', password: 'a-long-passphrase' });
-  assert.equal(reg.status, 200);
+  assert.equal(reg.status, 201);
   const stored = db.prepare('SELECT password_hash FROM users WHERE email = ?').get('ada@example.com').password_hash;
   assert.match(stored, /^scrypt\$/);
 
