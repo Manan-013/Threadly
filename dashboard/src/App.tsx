@@ -181,6 +181,7 @@ export const App: React.FC = () => {
   const handleLogout = () => {
     setActiveUserId(null);
     localStorage.removeItem('threadly_active_user_id');
+    localStorage.removeItem('threadly_auth_token');
     localStorage.setItem('threadly_logged_out', '1');
     setShowUserMenu(false);
   };
@@ -300,7 +301,10 @@ export const App: React.FC = () => {
         })
         .catch(() => {});
     }
-    const socket = io('http://localhost:4000');
+    const token = localStorage.getItem('threadly_auth_token');
+    const socket = io(window.location.origin.includes('localhost:5173') ? 'http://localhost:4000' : window.location.origin, {
+      auth: { token },
+    });
     socketRef.current = socket;
 
     socket.on('oauth_connected', () => {
@@ -318,6 +322,11 @@ export const App: React.FC = () => {
       if (activeConvIdRef.current === updated.id) {
         setActiveConversation(updated);
       }
+    });
+
+    socket.on('conversation_list_invalidated', () => {
+      fetchConversations();
+      fetchBootstrap();
     });
 
     socket.on('conversation_created', () => {
@@ -521,9 +530,10 @@ export const App: React.FC = () => {
   if (!currentUser) {
     return (
       <AuthScreen
-        onAuthenticated={(user: any) => {
+        onAuthenticated={(user: any, token: string) => {
           setActiveUserId(user.id);
           localStorage.setItem('threadly_active_user_id', String(user.id));
+          if (token) localStorage.setItem('threadly_auth_token', token);
           localStorage.removeItem('threadly_logged_out');
           fetchBootstrap();
           fetchConversations();
