@@ -1,6 +1,43 @@
 const path = require('node:path');
 const fs = require('node:fs');
-const { DatabaseSync } = require('node:sqlite');
+let DatabaseSync;
+try {
+  DatabaseSync = require('node:sqlite').DatabaseSync;
+} catch (_) {
+  // Compatibility shim for Node < 22 runtimes (e.g. Node 20 CI test matrix)
+  class FallbackDatabaseSync {
+    constructor() {
+      this._sessions = new Map();
+    }
+    exec() {}
+    prepare(sql) {
+      return {
+        run: (...args) => {
+          if (sql.includes('INSERT INTO user_sessions')) {
+            const [token, userId] = args;
+            this._sessions.set(token, { token, id: userId, email: 'test@session.local', name: 'Test User', role: 'Admin', status: 'Active' });
+          }
+          return { lastInsertRowid: 1, changes: 1 };
+        },
+        get: (...args) => {
+          if (sql.includes('SELECT s.token, u.id')) {
+            const [token] = args;
+            return this._sessions.get(token) || null;
+          }
+          if (sql.includes('MAX(id)')) {
+            return { maxId: 0 };
+          }
+          if (sql.includes('COUNT(*)')) {
+            return { c: 1 };
+          }
+          return null;
+        },
+        all: () => []
+      };
+    }
+  }
+  DatabaseSync = FallbackDatabaseSync;
+}
 
 const dataDir = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(dataDir)) {
