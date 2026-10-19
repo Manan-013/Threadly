@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-red.svg)](LICENSE)
 [![Manifest V3](https://img.shields.io/badge/Chrome_Extension-Manifest_V3-blue.svg)](https://developer.chrome.com/docs/extensions/mv3/)
-[![Node.js](https://img.shields.io/badge/Node.js-v18%2B-green.svg)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-22.13%2B-green.svg)](https://nodejs.org/)
 [![React](https://img.shields.io/badge/React-18-61dafb.svg)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6.svg)](https://www.typescriptlang.org/)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-3-38bdf8.svg)](https://tailwindcss.com/)
@@ -49,7 +49,7 @@ Traditional helpdesks like Zendesk, Front, and Intercom force support teams to a
 - **Shared Drafts & Split Private Replies**: Draft responses cooperatively with your team before dispatching to the client.
 
 ### Privacy & Authentication
-- **Built-In Email & Password Auth**: Secure user registration and login powered by cryptographic `PBKDF2-SHA512` hashing.
+- **Built-In Email & Password Auth**: Registration and login with passwords hashed using `scrypt` (N=2^15, r=8, p=1) with a random per-user salt and constant-time comparison. Hashes from older versions are upgraded automatically on the next successful login.
 - **Zero Third-Party Telemetry**: No tracking pixels, external data brokers, or proprietary cloud dependencies.
 
 ---
@@ -113,7 +113,7 @@ The full application runs on `http://localhost:4000`.
 ### Option B: Local Development Setup
 
 #### Prerequisites
-- [Node.js](https://nodejs.org/) v20.x or v22.x LTS
+- [Node.js](https://nodejs.org/) 22.13 or newer (22 LTS or 24); the backend uses the built-in `node:sqlite` module. Run `nvm use` to pick up `.nvmrc`.
 - Google Chrome (or any Chromium browser: Brave, Edge, Arc)
 - `npm` v10+
 

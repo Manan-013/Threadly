@@ -85,6 +85,20 @@
       <div style="font-weight:600;margin-bottom:4px;letter-spacing:-0.01em;">Unified Gmail &amp; Dashboard Sync</div>
       <div id="setup-summary" style="color:#64748B;">Connecting...</div>
     </div>
+    <div id="login-card" class="card" style="margin-top:8px;display:none;">
+      <div style="font-weight:600;margin-bottom:6px;font-size:11px;">Sign in to Threadly</div>
+      <form id="login-form">
+        <input id="login-email" type="email" required autocomplete="username" placeholder="Email" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #CBD5E1;border-radius:6px;font-size:11px;outline:none;margin-bottom:6px;" />
+        <input id="login-password" type="password" required autocomplete="current-password" placeholder="Password" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #CBD5E1;border-radius:6px;font-size:11px;outline:none;" />
+        <div id="login-error" style="color:#991B1B;font-size:11px;margin-top:4px;min-height:14px;"></div>
+        <button type="submit" style="width:100%;margin-top:4px;padding:6px;background:#DC2626;color:#fff;border:none;border-radius:6px;font-size:11px;cursor:pointer;">Sign in</button>
+      </form>
+    </div>
+    <div id="account-card" class="card" style="margin-top:8px;display:none;">
+      <div style="font-size:11px;color:#64748B;">Signed in as</div>
+      <div id="account-name" style="font-weight:600;margin:2px 0 6px;"></div>
+      <button id="logout-btn" style="width:100%;padding:5px;background:#F1F5F9;color:#0F172A;border:1px solid #CBD5E1;border-radius:6px;font-size:11px;cursor:pointer;">Sign out</button>
+    </div>
     <div class="card" style="margin-top:8px;">
       <div style="font-weight:600;margin-bottom:6px;font-size:11px;">Team Server Configuration</div>
       <input id="server-url-input" type="text" placeholder="http://localhost:4000" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #CBD5E1;border-radius:6px;font-size:11px;font-family:monospace;outline:none;" />

@@ -1601,14 +1601,14 @@
           if (!activeConversation) await syncCurrentGmailThread();
           const bodyText = (box.innerText || '').trim();
           if (activeConversation && bodyText) {
+            // Gmail itself sends this email (the Send button is clicked below), so ask Threadly only to
+            // record it. delivery:'external' stops the server from emailing the customer a second copy.
             await apiCall(`/api/conversations/${activeConversation.id}/messages`, 'POST', {
-              sender_name: getActiveActorName(),
-              sender_email: activeUserEmail,
-              recipient_email: activeConversation.customer_email,
               body: bodyText,
               is_agent_reply: 1,
               is_private_split: isSplitting ? 1 : 0,
               close_on_send: sendTargetStatus === 'Closed',
+              delivery: 'external',
             });
           }
           if (activeConversation) {
@@ -1782,9 +1782,6 @@
               `/api/conversations/${activeConversation.id}/messages`,
               'POST',
               {
-                sender_name: getActiveActorName(),
-                sender_email: activeUserEmail,
-                recipient_email: activeConversation.customer_email,
                 body: (box.innerText || '').trim() || 'Scheduled reply',
                 is_agent_reply: 1,
                 scheduled_for: isoStr,
@@ -1808,8 +1805,9 @@
         });
         pop.querySelector('.t-sched-cancel').onclick = () => pop.remove();
         pop.querySelector('.t-sched-confirm').onclick = () => {
+          // datetime-local has no timezone: convert to an absolute instant before it reaches the server.
           const dt = pop.querySelector('.t-sched-input').value;
-          if (dt) doSchedule(dt);
+          if (dt && !Number.isNaN(new Date(dt).getTime())) doSchedule(new Date(dt).toISOString());
         };
       };
 

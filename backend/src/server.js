@@ -5,10 +5,6 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const {
   db,
-  createSession,
-  validateSession,
-  hashPassword,
-  verifyPassword,
   generateConversationCode,
   generateToken,
   logActivity,
@@ -23,13 +19,28 @@ const {
   generateAiSummary,
   generateSmartReply,
 } = require('./engine');
-const { seedWorkspaceData } = require('./seed');
 const {
-  getSavedGmailCredentials,
-  syncGmailImap,
-  sendGmailSmtp,
-  bulkSyncFromExtension,
-} = require('./gmailSync');
+  hashPassword,
+  verifyPassword,
+  needsRehash,
+  verifyAgainstDummy,
+} = require('./services/passwords');
+const config = require('./config');
+const { createSession, validateSession, destroySession, destroySessionsForUser } = require('./services/sessions');
+const { requireAuth, requireAdmin, authGate } = require('./middleware/auth');
+const oauthState = require('./services/oauthState');
+const { hostGuard, corsMiddleware, socketAllowRequest, socketCorsOrigin } = require('./middleware/cors');
+const { ValidationError, parseCcList, assertNoHeaderInjection } = require('./services/mailer');
+const {
+  deliverMessage,
+  applySentEffects,
+  claimForRetry,
+  setNotifier,
+  startScheduler,
+  recoverInterruptedDeliveries,
+} = require('./services/delivery');
+const { seedWorkspaceData } = require('./seed');
+const { bulkSyncFromExtension } = require('./gmailSync');
 const {
   getOAuthConfig,
   getAuthUrl,
@@ -37,116 +48,55 @@ const {
   getConnectedAccount,
   getValidAccessToken,
   syncGmailViaOAuth,
-  sendGmailViaOAuth,
   disconnectGoogle,
-  simulateDemoLogin,
 } = require('./googleAuth');
 
 const app = express();
 const server = http.createServer(app);
 
-// Safe allowed origins: local dev, local dashboard, and official Gmail domains
-const ALLOWED_ORIGIN_PATTERNS = [
-  /^http:\/\/localhost:(4000|5173)$/,
-  /^http:\/\/127\.0\.0\.1:(4000|5173)$/,
-  /^https:\/\/mail\.google\.com$/,
-  /^chrome-extension:\/\//,
-];
-
-function isOriginAllowed(origin) {
-  if (!origin) return true; // Server-to-server or same-origin
-  return ALLOWED_ORIGIN_PATTERNS.some(pat => pat.test(origin));
+if (config.trustProxy) {
+  // Needed for correct client IPs (rate limiting) behind a reverse proxy: TRUST_PROXY=1 or "loopback".
+  app.set('trust proxy', /^\d+$/.test(config.trustProxy) ? Number(config.trustProxy) : config.trustProxy);
 }
 
+// Browser access is limited to ALLOWED_ORIGINS (plus same-origin); see middleware/cors.js.
 const io = new Server(server, {
+  allowRequest: socketAllowRequest,
   cors: {
-    origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) callback(null, true);
-      else callback(new Error('Origin blocked by CORS policy'));
-    },
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    credentials: true,
+    origin: socketCorsOrigin,
+    methods: ['GET', 'POST'],
+    credentials: false,
   },
 });
 
-// Socket.io handshake authentication
+// Socket.io handshake authentication: a valid session token is mandatory.
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
-  // If users exist in database, require valid session
-  const userCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-  if (userCount > 0 && token) {
-    const session = validateSession(token);
-    if (!session) {
-      return next(new Error('Authentication failed'));
-    }
-    socket.user = session;
+  const user = typeof token === 'string' ? validateSession(token) : null;
+  if (!user) {
+    return next(new Error('Authentication failed'));
   }
+  socket.user = user;
   next();
 });
 
-// Origin & Private Network Access Protection
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && isOriginAllowed(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-user-id');
-    res.setHeader('Access-Control-Allow-Private-Network', 'true');
-  } else if (!origin) {
-    // Same-origin or non-browser client
-    res.setHeader('Access-Control-Allow-Private-Network', 'true');
-  }
-
-  if (req.method === 'OPTIONS') {
-    if (origin && !isOriginAllowed(origin)) {
-      return res.status(403).send('Origin forbidden');
-    }
-    return res.sendStatus(204);
-  }
-  next();
-});
+app.use(hostGuard);
+app.use(corsMiddleware);
 
 app.use(express.json({ limit: '5mb' }));
 
-// Global Authentication Middleware
-function requireAuth(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const legacyUserId = req.headers['x-user-id'];
+// Deny by default: every /api route needs a valid session unless it is on the public allowlist
+// in middleware/auth.js (register, login, health, OAuth callback, public share permalink).
+app.use('/api', authGate);
 
-  // Check database user count. If zero users exist, allow first user setup
-  const userCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-  if (userCount === 0) {
-    return next();
-  }
+const ROLES = ['Admin', 'Supervisor', 'Agent', 'Collaborator'];
+const USER_STATUSES = ['Active', 'Away', 'Offline', 'Disabled'];
+// Never select users.* in responses: it contains password_hash.
+const USER_COLUMNS = 'id, name, email, role, status, max_capacity, created_at';
 
-  if (token) {
-    const session = validateSession(token);
-    if (session) {
-      req.user = session;
-      return next();
-    }
-  }
-
-  // Fallback for active local session
-  if (legacyUserId) {
-    const u = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(Number(legacyUserId));
-    if (u) {
-      req.user = u;
-      return next();
-    }
-  }
-
-  return res.status(401).json({ error: 'Unauthorized. Please sign in.' });
-}
-
-function requireAdmin(req, res, next) {
-  if (!req.user || req.user.role !== 'Admin') {
-    return res.status(403).json({ error: 'Admin permission required.' });
-  }
-  next();
-}
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true });
+});
 
 // Track real-time presence per conversation for Collision Detection
 // Map<conversationId, Map<socketId, { userName, userEmail, isTyping }>>
@@ -245,16 +195,18 @@ function broadcastConversationUpdate(convId) {
 
 // Socket.io Real-time Collaboration & Collision Detection
 io.on('connection', (socket) => {
-  socket.on('join_conversation', ({ conversationId, userName, userEmail }) => {
-    const key = String(conversationId);
+  socket.on('join_conversation', ({ conversationId } = {}) => {
+    const cid = Number(conversationId);
+    if (!Number.isInteger(cid) || !db.prepare('SELECT 1 FROM conversations WHERE id = ?').get(cid)) return;
+    const key = String(cid);
     socket.join(`conv_${key}`);
     if (!conversationPresence.has(key)) {
       conversationPresence.set(key, new Map());
     }
     conversationPresence.get(key).set(socket.id, {
       socketId: socket.id,
-      userName: userName || 'Agent',
-      userEmail: userEmail || '',
+      userName: socket.user.name,
+      userEmail: socket.user.email,
       isTyping: false,
     });
     io.to(`conv_${key}`).emit('presence_updated', {
@@ -275,9 +227,11 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('shared_draft_change', ({ conversationId, toEmail, body, isSplitPrivate, updatedByName }) => {
+  socket.on('shared_draft_change', ({ conversationId, toEmail, body, isSplitPrivate } = {}) => {
     const cid = Number(conversationId);
-    if (!cid) return;
+    if (!Number.isInteger(cid) || !db.prepare('SELECT 1 FROM conversations WHERE id = ?').get(cid)) return;
+    if (typeof body === 'string' && body.length > 100000) return;
+    const updatedByName = socket.user.name;
     db.prepare(`
       INSERT INTO shared_drafts (conversation_id, to_email, body, is_split_private, updated_by_name, updated_at)
       VALUES (?, ?, ?, ?, ?, datetime('now'))
@@ -287,14 +241,14 @@ io.on('connection', (socket) => {
         is_split_private = excluded.is_split_private,
         updated_by_name = excluded.updated_by_name,
         updated_at = datetime('now')
-    `).run(cid, toEmail || '', body || '', isSplitPrivate ? 1 : 0, updatedByName || 'Team Member');
+    `).run(cid, toEmail || '', body || '', isSplitPrivate ? 1 : 0, updatedByName);
 
     socket.to(`conv_${cid}`).emit('shared_draft_synced', {
       conversation_id: cid,
       to_email: toEmail || '',
       body: body || '',
       is_split_private: isSplitPrivate ? 1 : 0,
-      updated_by_name: updatedByName || 'Team Member',
+      updated_by_name: updatedByName,
     });
   });
 
@@ -340,7 +294,7 @@ app.get('/api/bootstrap', (req, res) => {
     }
   }
 
-  const users = db.prepare('SELECT * FROM users ORDER BY id ASC').all().map(u => {
+  const users = db.prepare(`SELECT ${USER_COLUMNS} FROM users ORDER BY id ASC`).all().map(u => {
     const assignedRow = db.prepare(`
       SELECT COUNT(*) as cnt FROM conversations WHERE assignee_id = ? AND status != 'Closed'
     `).get(u.id);
@@ -355,7 +309,7 @@ app.get('/api/bootstrap', (req, res) => {
   });
   const inboxes = db.prepare('SELECT * FROM shared_inboxes ORDER BY id ASC').all().map(inbox => {
     const members = db.prepare(`
-      SELECT u.* FROM users u
+      SELECT u.id, u.name, u.email, u.role, u.status, u.max_capacity FROM users u
       JOIN inbox_members im ON im.user_id = u.id
       WHERE im.inbox_id = ?
     `).all(inbox.id);
@@ -414,7 +368,7 @@ app.get('/api/bootstrap', (req, res) => {
     ...c,
     config: JSON.parse(c.config_json || '{}'),
   }));
-  const webhooks = db.prepare('SELECT id, name, target_url, events_json, is_active, created_at, SUBSTR(secret_token, 1, 4) || "••••••••" as masked_secret FROM webhooks ORDER BY id DESC').all().map(w => ({
+  const webhooks = db.prepare(`SELECT id, name, target_url, events_json, is_active, created_at, SUBSTR(secret_token, 1, 4) || '••••••••' as masked_secret FROM webhooks ORDER BY id DESC`).all().map(w => ({
     ...w,
     events: JSON.parse(w.events_json || '[]'),
   }));
@@ -462,50 +416,93 @@ app.post('/api/settings', requireAuth, requireAdmin, (req, res) => {
 // ------------------------------------------------------------------
 // 2. USERS & TEAM ROLES
 // ------------------------------------------------------------------
-app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
-  const { name, email, role = 'Agent', status = 'Active', max_capacity = 25 } = req.body;
-  if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
+function isLastActiveAdmin(userId) {
+  // Only admins who can actually sign in count (seeded users have no password).
+  const admins = db.prepare("SELECT id FROM users WHERE role = 'Admin' AND status != 'Disabled' AND password_hash != ''").all();
+  return admins.length === 1 && admins[0].id === Number(userId);
+}
 
-  const existing = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)').get(email.trim());
-  if (existing) {
-    db.prepare('UPDATE users SET name = ?, role = ?, status = ?, max_capacity = ? WHERE id = ?')
-      .run(name.trim(), role, status, Number(max_capacity) || 25, existing.id);
-    const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(existing.id);
+app.post('/api/users', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const { name, email, role = 'Agent', status = 'Active', max_capacity = 25, password } = req.body;
+    if (typeof name !== 'string' || typeof email !== 'string' || !name.trim() || !email.trim()) {
+      return res.status(400).json({ error: 'Name and email are required' });
+    }
+    if (!ROLES.includes(role)) return res.status(400).json({ error: `Role must be one of: ${ROLES.join(', ')}` });
+    if (!USER_STATUSES.includes(status)) return res.status(400).json({ error: `Status must be one of: ${USER_STATUSES.join(', ')}` });
+    if (password !== undefined && (typeof password !== 'string' || password.length < 10 || password.length > 1024)) {
+      return res.status(400).json({ error: 'Password must be at least 10 characters.' });
+    }
+    const pwdHash = password ? await hashPassword(password) : null;
+
+    const existing = db.prepare('SELECT * FROM users WHERE LOWER(email) = LOWER(?)').get(email.trim());
+    if (existing) {
+      if (existing.role === 'Admin' && role !== 'Admin' && isLastActiveAdmin(existing.id)) {
+        return res.status(409).json({ error: 'Cannot demote the last active Admin.' });
+      }
+      db.prepare('UPDATE users SET name = ?, role = ?, status = ?, max_capacity = ?, password_hash = COALESCE(?, password_hash) WHERE id = ?')
+        .run(name.trim(), role, status, Number(max_capacity) || 25, pwdHash, existing.id);
+      if (pwdHash) destroySessionsForUser(existing.id);
+      const updated = db.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).get(existing.id);
+      io.emit('setup_updated', getSetupProgress());
+      return res.json(updated);
+    }
+
+    const info = db.prepare(`
+      INSERT INTO users (name, email, role, status, max_capacity, password_hash)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(name.trim(), email.trim(), role, status, Number(max_capacity) || 25, pwdHash || '');
+
+    const user = db.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).get(info.lastInsertRowid);
     io.emit('setup_updated', getSetupProgress());
-    return res.json(updated);
+    res.json(user);
+  } catch (err) {
+    next(err);
   }
-
-  const info = db.prepare(`
-    INSERT INTO users (name, email, role, status, max_capacity)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(name.trim(), email.trim(), role, status, Number(max_capacity) || 25);
-
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
-  io.emit('setup_updated', getSetupProgress());
-  res.json(user);
 });
 
-app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
-  const { status, role, name, max_capacity } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
+app.patch('/api/users/:id', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const { status, role, name, max_capacity, password } = req.body;
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (role !== undefined && !ROLES.includes(role)) return res.status(400).json({ error: `Role must be one of: ${ROLES.join(', ')}` });
+    if (status !== undefined && !USER_STATUSES.includes(status)) return res.status(400).json({ error: `Status must be one of: ${USER_STATUSES.join(', ')}` });
+    if (password !== undefined && (typeof password !== 'string' || password.length < 10 || password.length > 1024)) {
+      return res.status(400).json({ error: 'Password must be at least 10 characters.' });
+    }
+    const losesAdmin = user.role === 'Admin' && user.status !== 'Disabled' &&
+      ((role !== undefined && role !== 'Admin') || status === 'Disabled');
+    if (losesAdmin && isLastActiveAdmin(user.id)) {
+      return res.status(409).json({ error: 'Cannot demote or disable the last active Admin.' });
+    }
+    const pwdHash = password ? await hashPassword(password) : null;
 
-  db.prepare(`
-    UPDATE users
-    SET name = COALESCE(?, name),
-        role = COALESCE(?, role),
-        status = COALESCE(?, status),
-        max_capacity = COALESCE(?, max_capacity)
-    WHERE id = ?
-  `).run(name ?? null, role ?? null, status ?? null, max_capacity !== undefined ? Number(max_capacity) : null, user.id);
+    db.prepare(`
+      UPDATE users
+      SET name = COALESCE(?, name),
+          role = COALESCE(?, role),
+          status = COALESCE(?, status),
+          max_capacity = COALESCE(?, max_capacity),
+          password_hash = COALESCE(?, password_hash)
+      WHERE id = ?
+    `).run(name ?? null, role ?? null, status ?? null, max_capacity !== undefined ? Number(max_capacity) : null, pwdHash, user.id);
+    if (pwdHash) destroySessionsForUser(user.id);
 
-  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
-  io.emit('user_updated', updated);
-  res.json(updated);
+    const updated = db.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).get(user.id);
+    io.emit('user_updated', updated);
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
-  db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+  const target = db.prepare('SELECT id, role, status FROM users WHERE id = ?').get(req.params.id);
+  if (target && target.role === 'Admin' && isLastActiveAdmin(target.id)) {
+    return res.status(409).json({ error: 'Cannot delete the last active Admin.' });
+  }
+  db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id); // sessions cascade
   io.emit('setup_updated', getSetupProgress());
   res.json({ ok: true });
 });
@@ -513,7 +510,7 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
 // ------------------------------------------------------------------
 // 3. SHARED INBOXES
 // ------------------------------------------------------------------
-app.post('/api/inboxes', (req, res) => {
+app.post('/api/inboxes', requireAdmin, (req, res) => {
   const {
     name,
     email,
@@ -551,7 +548,7 @@ app.post('/api/inboxes', (req, res) => {
   res.json(inbox);
 });
 
-app.patch('/api/inboxes/:id', (req, res) => {
+app.patch('/api/inboxes/:id', requireAdmin, (req, res) => {
   const { name, auto_assign_mode, csat_enabled, business_hours, member_ids } = req.body;
   const inbox = db.prepare('SELECT * FROM shared_inboxes WHERE id = ?').get(req.params.id);
   if (!inbox) return res.status(404).json({ error: 'Inbox not found' });
@@ -725,6 +722,14 @@ app.get('/api/conversations', requireAuth, (req, res) => {
   res.json(result);
 });
 
+// Internal permalink lookup (?thread=<conversation code>); requires a session like every other route.
+app.get('/api/conversations/by-code/:code', (req, res) => {
+  const row = db.prepare('SELECT id FROM conversations WHERE conversation_code = ?').get(req.params.code);
+  const conv = row ? hydrateConversation(row.id) : null;
+  if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+  res.json(conv);
+});
+
 app.get('/api/conversations/:id', (req, res) => {
   const cid = Number(req.params.id);
   const conv = hydrateConversation(cid);
@@ -732,37 +737,41 @@ app.get('/api/conversations/:id', (req, res) => {
   res.json(conv);
 });
 
-// Public Share Permalink Lookup: requires explicit public_link_enabled = 1 and public_token match
-app.get('/api/shared/:codeOrToken', (req, res) => {
-  const token = req.params.codeOrToken;
-  // Match only against public_token when public_link_enabled is true
-  const row = db.prepare(`
-    SELECT id FROM conversations
+// Public share permalink (no session). Matches ONLY the unguessable public_token and only while the
+// owner has the link enabled; conversation codes and numeric ids never resolve here. The response is
+// built from an explicit allowlist of columns: internal notes, activity log, assignee, watchers,
+// tags, drafts, email addresses and private split replies are never loaded for this route.
+const PUBLIC_TOKEN_PATTERN = /^[A-Za-z0-9_-]{20,128}$/;
+
+app.get('/api/shared/:token', (req, res) => {
+  res.set({ 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow', 'Referrer-Policy': 'no-referrer' });
+  const token = req.params.token;
+  const notFound = () => res.status(404).json({ error: 'Public link is disabled or invalid.' });
+  if (!PUBLIC_TOKEN_PATTERN.test(token)) return notFound();
+
+  const conv = db.prepare(`
+    SELECT id, conversation_code, subject, customer_name, status, created_at, updated_at
+    FROM conversations
     WHERE public_token = ? AND public_link_enabled = 1
   `).get(token);
+  if (!conv) return notFound();
 
-  if (!row) {
-    return res.status(404).json({ error: 'Public link is disabled or invalid.' });
-  }
+  const messages = db.prepare(`
+    SELECT id, sender_name, is_agent_reply, body, created_at
+    FROM messages
+    WHERE conversation_id = ? AND is_private_split = 0 AND status = 'sent'
+    ORDER BY id ASC
+  `).all(conv.id);
 
-  const full = hydrateConversation(row.id);
-  if (!full) return res.status(404).json({ error: 'Conversation not found' });
-
-  // Security: Never leak internal notes, watchers, or internal drafts over public permalinks
-  const sanitized = {
-    id: full.id,
-    conversation_code: full.conversation_code,
-    subject: full.subject,
-    customer_name: full.customer_name,
-    customer_email: full.customer_email,
-    status: full.status,
-    priority: full.priority,
-    created_at: full.created_at,
-    updated_at: full.updated_at,
-    messages: (full.messages || []).filter(m => !m.is_private_split),
-    tags: full.tags,
-  };
-  res.json(sanitized);
+  res.json({
+    conversation_code: conv.conversation_code,
+    subject: conv.subject,
+    customer_name: conv.customer_name,
+    status: conv.status,
+    created_at: conv.created_at,
+    updated_at: conv.updated_at,
+    messages,
+  });
 });
 
 // Used by both the Dashboard (Compose / Receive Inbound) and Gmail Extension Sync
@@ -776,8 +785,8 @@ app.post('/api/conversations', (req, res) => {
     customer_email,
     recipient_email = '',
     body = '',
-    actor_name = 'System',
   } = req.body;
+  const actor_name = req.user.name;
 
   if (!subject || !customer_email) {
     return res.status(400).json({ error: 'Subject and customer email are required' });
@@ -877,8 +886,8 @@ app.patch('/api/conversations/:id', (req, res) => {
     snoozed_until,
     csat_rating,
     csat_comment,
-    actor_name = 'You',
   } = req.body;
+  const actor_name = req.user.name;
 
   if (inbox_id !== undefined && Number(inbox_id) !== conv.inbox_id) {
     db.prepare('UPDATE conversations SET inbox_id = ?, updated_at = datetime(' + "'now'" + ') WHERE id = ?')
@@ -934,6 +943,10 @@ app.patch('/api/conversations/:id', (req, res) => {
   if (public_link_enabled !== undefined) {
     db.prepare(`UPDATE conversations SET public_link_enabled = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(public_link_enabled ? 1 : 0, convId);
+    if (!public_link_enabled && conv.public_link_enabled) {
+      // Turning a link off rotates its token, so an old copy of the URL can never come back to life.
+      db.prepare('UPDATE conversations SET public_token = ? WHERE id = ?').run(generateToken(), convId);
+    }
   }
 
   if (snoozed_until !== undefined) {
@@ -957,7 +970,8 @@ app.patch('/api/conversations/:id', (req, res) => {
 // Add Tag to Conversation
 app.post('/api/conversations/:id/tags', (req, res) => {
   const convId = Number(req.params.id);
-  const { tag_id, tag_name, color = '#DC2626', actor_name = 'You' } = req.body;
+  const { tag_id, tag_name, color = '#DC2626' } = req.body;
+  const actor_name = req.user.name;
   const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
   if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
@@ -996,7 +1010,7 @@ app.post('/api/conversations/:id/tags', (req, res) => {
 app.delete('/api/conversations/:id/tags/:tagId', (req, res) => {
   const convId = Number(req.params.id);
   const tagId = Number(req.params.tagId);
-  const actorName = req.query.actor_name || 'You';
+  const actorName = req.user.name;
 
   const tag = db.prepare('SELECT * FROM tags WHERE id = ?').get(tagId);
   const deleted = db.prepare('DELETE FROM conversation_tags WHERE conversation_id = ? AND tag_id = ?').run(convId, tagId);
@@ -1013,130 +1027,159 @@ app.delete('/api/conversations/:id/tags/:tagId', (req, res) => {
 });
 
 // Send Reply / Message / Split Conversation / Send & Close / Send Later
-app.post('/api/conversations/:id/messages', (req, res) => {
-  const convId = Number(req.params.id);
-  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
-  if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+//
+// Agent replies:
+//  - To: always the conversation's customer. A different `recipient_email` is rejected.
+//  - From: the connected mailbox (services/delivery.js); the sender name comes from the session.
+//  - The row is created as 'sending' (or 'scheduled'), and becomes 'sent' only after the provider
+//    accepted it, or 'failed' with the error stored. A failed delivery answers HTTP 502.
+//  - delivery: 'external' records a reply that the caller sends itself (the Gmail extension clicks
+//    Gmail's own Send button); the server then does NOT send a second copy.
+app.post('/api/conversations/:id/messages', async (req, res, next) => {
+  try {
+    const convId = Number(req.params.id);
+    const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
+    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
-  const {
-    sender_name,
-    sender_email,
-    recipient_email,
-    cc_emails = '',
-    body,
-    is_agent_reply = 1,
-    is_private_split = 0,
-    scheduled_for = null,
-    close_on_send = false,
-  } = req.body;
+    const {
+      recipient_email,
+      cc_emails = '',
+      body,
+      is_agent_reply = 1,
+      is_private_split = 0,
+      scheduled_for = null,
+      close_on_send = false,
+      delivery = 'server',
+    } = req.body;
 
-  if (!body || !body.trim()) return res.status(400).json({ error: 'Message body is required' });
+    if (typeof body !== 'string' || !body.trim()) return res.status(400).json({ error: 'Message body is required' });
+    if (body.length > 100000) return res.status(400).json({ error: 'Message body is too long' });
 
-  const msgStatus = scheduled_for ? 'scheduled' : 'sent';
-  const insertInfo = db.prepare(`
-    INSERT INTO messages (
-      conversation_id, sender_name, sender_email, recipient_email, cc_emails,
-      body, is_agent_reply, is_private_split, scheduled_for, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    convId,
-    sender_name || (is_agent_reply ? 'Agent' : conv.customer_name),
-    sender_email || (is_agent_reply ? 'agent@threadly.app' : conv.customer_email),
-    recipient_email || (is_agent_reply ? conv.customer_email : 'inbox@threadly.app'),
-    cc_emails,
-    body.trim(),
-    is_agent_reply ? 1 : 0,
-    is_private_split ? 1 : 0,
-    scheduled_for,
-    msgStatus
-  );
-  const msgId = insertInfo.lastInsertRowid;
+    if (!is_agent_reply) {
+      // Simulated/inbound customer message: identity comes from the conversation.
+      db.prepare(`
+        INSERT INTO messages (conversation_id, sender_name, sender_email, recipient_email, body, is_agent_reply, status)
+        VALUES (?, ?, ?, ?, ?, 0, 'sent')
+      `).run(convId, conv.customer_name, conv.customer_email, 'inbox@threadly.app', body.trim());
 
-  // Clear shared draft once sent
-  if (is_agent_reply) {
-    db.prepare('DELETE FROM shared_drafts WHERE conversation_id = ?').run(convId);
-    db.prepare(`
-      UPDATE conversations
-      SET first_responded_at = COALESCE(first_responded_at, datetime('now')),
-          updated_at = datetime('now')
-      WHERE id = ?
-    `).run(convId);
-
-    if (is_private_split) {
-      logActivity(convId, sender_name || 'You', 'split_conversation', `${sender_name || 'You'} replied privately via Split conversation.`);
-    } else if (scheduled_for) {
-      logActivity(convId, sender_name || 'You', 'replied', `${sender_name || 'You'} scheduled a reply for ${new Date(scheduled_for).toLocaleString()}.`);
-    } else {
-      logActivity(convId, sender_name || 'You', 'replied', `${sender_name || 'You'} replied to ${conv.customer_name}.`);
+      if (conv.status === 'Closed' && isThankYouReply(body)) {
+        logActivity(convId, 'Threadly AI', 'automation_triggered',
+          'AI Auto-Closer detected a thank-you reply and kept the conversation Closed.');
+      } else if (conv.status === 'Closed') {
+        db.prepare(`UPDATE conversations SET status = 'Open', updated_at = datetime('now') WHERE id = ?`).run(convId);
+        logActivity(convId, conv.customer_name, 'status_changed', 'Conversation reopened by customer reply.');
+      }
+      broadcastConversationUpdate(convId);
+      return res.json(hydrateConversation(convId));
     }
 
-    if (close_on_send) {
-      db.prepare(`UPDATE conversations SET status = 'Closed', resolved_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(convId);
-      logActivity(convId, sender_name || 'You', 'status_changed', `${sender_name || 'You'} closed conversation via Send & Close.`);
+    // ---- agent reply: validate everything before anything is written
+    if (!['server', 'external'].includes(delivery)) {
+      return res.status(400).json({ error: "delivery must be 'server' or 'external'" });
     }
-
-    if (!scheduled_for) {
-      const oauthAcc = getConnectedAccount();
-      // Ensure sender is restricted to connected email or provisioned team inbox
-      const allowedSenders = [oauthAcc?.email, conv.inbox_email, req.user?.email].filter(Boolean).map(e => e.toLowerCase());
-      const targetFromEmail = (sender_email && allowedSenders.includes(sender_email.toLowerCase()))
-        ? sender_email
-        : (oauthAcc?.email || conv.inbox_email || 'support@threadly.app');
-
-      // Only allow sending to the customer's actual conversation thread email or explicit verified recipient
-      const targetToEmail = recipient_email ? recipient_email.trim() : conv.customer_email;
-
-      if (oauthAcc?.email) {
-        sendGmailViaOAuth({
-          email: oauthAcc.email,
-          to: targetToEmail,
-          subject: conv.subject.startsWith('Re:') ? conv.subject : `Re: ${conv.subject}`,
-          body: body.trim(),
-        }).catch(err => {
-          console.warn('Google OAuth send failed:', err.message);
-          db.prepare('UPDATE messages SET status = "failed" WHERE id = ?').run(msgId);
-          logActivity(convId, 'System', 'delivery_failed', `Failed to deliver email: ${err.message}`);
-          broadcastConversationUpdate(convId);
-        });
-      } else {
-        sendGmailSmtp({
-          fromEmail: targetFromEmail,
-          fromName: sender_name || 'Support Team',
-          toEmail: targetToEmail,
-          ccEmails: cc_emails,
-          subject: conv.subject.startsWith('Re:') ? conv.subject : `Re: ${conv.subject}`,
-          body: body.trim(),
-        }).catch(err => {
-          console.warn('SMTP send failed:', err.message);
-          db.prepare('UPDATE messages SET status = "failed" WHERE id = ?').run(msgId);
-          logActivity(convId, 'System', 'delivery_failed', `Failed to deliver email via SMTP: ${err.message}`);
-          broadcastConversationUpdate(convId);
-        });
+    if (recipient_email !== undefined && recipient_email !== null && recipient_email !== '') {
+      assertNoHeaderInjection(recipient_email, 'Recipient');
+      if (String(recipient_email).trim().toLowerCase() !== String(conv.customer_email).toLowerCase()) {
+        return res.status(400).json({ error: "Replies can only be sent to this conversation's customer address." });
       }
     }
-  } else {
-    // Customer reply: check AI Thank-You Detector if conversation is currently Closed
-    if (conv.status === 'Closed' && isThankYouReply(body)) {
-      logActivity(
-        convId,
-        'Threadly AI',
-        'automation_triggered',
-        'AI Auto-Closer detected a thank-you reply and kept the conversation Closed.'
-      );
-    } else if (conv.status === 'Closed') {
-      db.prepare(`UPDATE conversations SET status = 'Open', updated_at = datetime('now') WHERE id = ?`).run(convId);
-      logActivity(convId, conv.customer_name, 'status_changed', 'Conversation reopened by customer reply.');
-    }
-  }
+    const cc = parseCcList(cc_emails); // throws ValidationError (400) on bad addresses or CR/LF
 
-  broadcastConversationUpdate(convId);
-  res.json(hydrateConversation(convId));
+    let scheduledIso = null;
+    if (scheduled_for) {
+      const when = new Date(scheduled_for);
+      const now = Date.now();
+      if (Number.isNaN(when.getTime())) return res.status(400).json({ error: 'scheduled_for is not a valid date.' });
+      if (when.getTime() <= now) return res.status(400).json({ error: 'scheduled_for must be in the future.' });
+      if (when.getTime() > now + 366 * 24 * 3600 * 1000) return res.status(400).json({ error: 'scheduled_for must be within one year.' });
+      if (delivery === 'external') return res.status(400).json({ error: 'External replies cannot be scheduled.' });
+      scheduledIso = when.toISOString();
+    }
+
+    const sender_name = req.user.name; // identity from the session, never from the body
+    const status = scheduledIso ? 'scheduled' : delivery === 'external' ? 'sent' : 'sending';
+    const insert = db.prepare(`
+      INSERT INTO messages (
+        conversation_id, sender_name, sender_email, recipient_email, cc_emails, body,
+        is_agent_reply, is_private_split, scheduled_for, status, delivery_mode, close_on_send, sent_at, attempts
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ${status === 'sent' ? "datetime('now')" : 'NULL'}, ?)
+    `).run(
+      convId,
+      sender_name,
+      req.user.email,
+      conv.customer_email,
+      cc.join(', '),
+      body.trim(),
+      is_private_split ? 1 : 0,
+      scheduledIso,
+      status,
+      delivery,
+      close_on_send ? 1 : 0,
+      status === 'sending' ? 1 : 0
+    );
+    const msgId = Number(insert.lastInsertRowid);
+    db.prepare('DELETE FROM shared_drafts WHERE conversation_id = ?').run(convId);
+
+    if (status === 'scheduled') {
+      logActivity(convId, sender_name, 'replied', `${sender_name} scheduled a reply for ${new Date(scheduledIso).toLocaleString()}.`);
+      broadcastConversationUpdate(convId);
+      return res.json(hydrateConversation(convId));
+    }
+
+    if (status === 'sent') {
+      // External: the caller sends it (Gmail UI); we only record it.
+      applySentEffects({ conversation_id: convId, sender_name, is_private_split, close_on_send, customer_name: conv.customer_name });
+      broadcastConversationUpdate(convId);
+      return res.json(hydrateConversation(convId));
+    }
+
+    const outcome = await deliverMessage(msgId);
+    broadcastConversationUpdate(convId);
+    if (!outcome.ok) {
+      return res.status(502).json({
+        error: `Message saved but not delivered: ${outcome.error}`,
+        message_id: msgId,
+        conversation: hydrateConversation(convId),
+      });
+    }
+    res.json(hydrateConversation(convId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Retry a message whose delivery failed.
+app.post('/api/messages/:id/retry', async (req, res, next) => {
+  try {
+    const msgId = Number(req.params.id);
+    const msg = db.prepare('SELECT id, conversation_id, status, delivery_mode FROM messages WHERE id = ?').get(msgId);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+    if (msg.status !== 'failed' || msg.delivery_mode !== 'server') {
+      return res.status(409).json({ error: 'Only messages whose delivery failed can be retried.' });
+    }
+    if (!claimForRetry(msgId)) return res.status(409).json({ error: 'This message is already being retried.' });
+
+    const outcome = await deliverMessage(msgId);
+    broadcastConversationUpdate(msg.conversation_id);
+    if (!outcome.ok) {
+      return res.status(502).json({
+        error: `Message not delivered: ${outcome.error}`,
+        message_id: msgId,
+        conversation: hydrateConversation(msg.conversation_id),
+      });
+    }
+    res.json(hydrateConversation(msg.conversation_id));
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Internal Notes (+ Add a note... or Save as note from AI Summarizer)
 app.post('/api/conversations/:id/notes', (req, res) => {
   const convId = Number(req.params.id);
-  const { author_id = null, author_name = 'You', body, is_ai_summary = 0 } = req.body;
+  const { body, is_ai_summary = 0 } = req.body;
+  const author_id = req.user.id;
+  const author_name = req.user.name;
   if (!body || !body.trim()) return res.status(400).json({ error: 'Note text is required' });
 
   const mentions = (body.match(/@[\w.-]+/g) || []).map(m => m.slice(1));
@@ -1174,13 +1217,17 @@ app.post('/api/conversations/:id/ai-reply', (req, res) => {
 // Approvals Workflow
 app.post('/api/conversations/:id/approvals', (req, res) => {
   const convId = Number(req.params.id);
-  const { requested_by_name = 'You', approver_id = null, approver_name = 'Manager', title, description = '' } = req.body;
+  const { approver_id = null, title, description = '' } = req.body;
+  const requested_by_name = req.user.name;
   if (!title) return res.status(400).json({ error: 'Approval title is required' });
+  const approver = approver_id ? db.prepare('SELECT id, name FROM users WHERE id = ?').get(Number(approver_id)) : null;
+  if (approver_id && !approver) return res.status(400).json({ error: 'Approver not found' });
+  const approver_name = approver ? approver.name : 'Manager';
 
   db.prepare(`
     INSERT INTO approvals (conversation_id, requested_by_name, approver_id, approver_name, title, description)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(convId, requested_by_name, approver_id, approver_name, title.trim(), description.trim());
+  `).run(convId, requested_by_name, approver ? approver.id : null, approver_name, title.trim(), description.trim());
 
   logActivity(convId, requested_by_name, 'approval_requested', `${requested_by_name} requested approval from ${approver_name}: "${title.trim()}".`);
   broadcastConversationUpdate(convId);
@@ -1188,9 +1235,17 @@ app.post('/api/conversations/:id/approvals', (req, res) => {
 });
 
 app.patch('/api/approvals/:id', (req, res) => {
-  const { status, decision_note = '', actor_name = 'Approver' } = req.body;
+  const { status, decision_note = '' } = req.body;
+  const actor_name = req.user.name;
   const approval = db.prepare('SELECT * FROM approvals WHERE id = ?').get(req.params.id);
   if (!approval) return res.status(404).json({ error: 'Approval not found' });
+  if (!['Approved', 'Rejected', 'Pending'].includes(status)) {
+    return res.status(400).json({ error: 'Status must be Approved, Rejected or Pending' });
+  }
+  // Only the designated approver (or an Admin) may decide an approval.
+  if (approval.approver_id && approval.approver_id !== req.user.id && req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Only the designated approver can decide this request.' });
+  }
 
   db.prepare(`
     UPDATE approvals SET status = ?, decision_note = ?, updated_at = datetime('now') WHERE id = ?
@@ -1227,7 +1282,8 @@ app.post('/api/conversations/:id/watchers', (req, res) => {
 // External Integration Cards (Jira, Salesforce, Asana, QuickBooks, Slack)
 app.post('/api/conversations/:id/external-links', (req, res) => {
   const convId = Number(req.params.id);
-  const { provider, external_id, title, status = 'Open', url = '', actor_name = 'You' } = req.body;
+  const { provider, external_id, title, status = 'Open', url = '' } = req.body;
+  const actor_name = req.user.name;
   if (!provider || !title) return res.status(400).json({ error: 'Provider and title required' });
 
   db.prepare(`
@@ -1244,7 +1300,8 @@ app.post('/api/conversations/:id/external-links', (req, res) => {
 // 6. EMAIL TEMPLATES
 // ------------------------------------------------------------------
 app.post('/api/templates', (req, res) => {
-  const { name, category = 'General', subject = '', body, inbox_id = null, created_by = 'Admin' } = req.body;
+  const { name, category = 'General', subject = '', body, inbox_id = null } = req.body;
+  const created_by = req.user.name;
   if (!name || !body) return res.status(400).json({ error: 'Template name and body are required' });
 
   const info = db.prepare(`
@@ -1396,7 +1453,7 @@ app.delete('/api/kb/articles/:id', (req, res) => {
 // ------------------------------------------------------------------
 // 9. CONNECTORS, CHATBOTS & WEBHOOKS (ADMIN PANEL)
 // ------------------------------------------------------------------
-app.post('/api/connectors', (req, res) => {
+app.post('/api/connectors', requireAdmin, (req, res) => {
   const { provider, is_connected, config = {} } = req.body;
   if (!provider) return res.status(400).json({ error: 'Provider is required' });
 
@@ -1429,7 +1486,7 @@ app.delete('/api/chatbots/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/webhooks', (req, res) => {
+app.post('/api/webhooks', requireAdmin, (req, res) => {
   const { name, target_url, events = ['conversation.created', 'conversation.closed'] } = req.body;
   if (!name || !target_url) return res.status(400).json({ error: 'Name and target URL required' });
   const secret = 'whsec_' + generateToken();
@@ -1441,7 +1498,7 @@ app.post('/api/webhooks', (req, res) => {
   res.json({ ...row, events: JSON.parse(row.events_json || '[]') });
 });
 
-app.delete('/api/webhooks/:id', (req, res) => {
+app.delete('/api/webhooks/:id', requireAdmin, (req, res) => {
   db.prepare('DELETE FROM webhooks WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
@@ -1579,7 +1636,8 @@ app.get('/api/analytics', (req, res) => {
 
 // Custom Dashboards (Screenshot 000510.png & 000518.png)
 app.post('/api/dashboards', (req, res) => {
-  const { name, created_by = 'Admin', widgets = [] } = req.body;
+  const { name, widgets = [] } = req.body;
+  const created_by = req.user.name;
   if (!name || !name.trim()) return res.status(400).json({ error: 'Dashboard name is required' });
 
   // Default widgets showing inbox cards if none supplied
@@ -1602,7 +1660,7 @@ app.post('/api/dashboards', (req, res) => {
 });
 
 app.patch('/api/dashboards/:id', (req, res) => {
-  const { name, widgets, created_by } = req.body;
+  const { name, widgets } = req.body;
   const row = db.prepare('SELECT * FROM custom_dashboards WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Dashboard not found' });
 
@@ -1610,13 +1668,11 @@ app.patch('/api/dashboards/:id', (req, res) => {
     UPDATE custom_dashboards
     SET name = COALESCE(?, name),
         widgets_json = COALESCE(?, widgets_json),
-        created_by = COALESCE(?, created_by),
         updated_at = datetime('now')
     WHERE id = ?
   `).run(
     name ? name.trim().slice(0, 65) : null,
     widgets ? JSON.stringify(widgets) : null,
-    created_by ?? null,
     row.id
   );
 
@@ -1723,9 +1779,11 @@ app.get('/api/exports/csv', (req, res) => {
 });
 
 // Google OAuth 2.0 Endpoints
-app.get('/api/auth/google/url', (req, res) => {
+// Connecting a Google account is an admin action. The `state` value is single-use, short-lived and
+// bound to the admin who started the flow, so the public callback cannot be driven by anyone else.
+app.get('/api/auth/google/url', requireAdmin, (req, res) => {
   const { isConfigured, clientId, redirectUri } = getOAuthConfig();
-  const url = getAuthUrl(req.query.state || 'threadly_dashboard');
+  const url = getAuthUrl(oauthState.create(req.user.id));
   res.json({
     isConfigured,
     url,
@@ -1735,99 +1793,129 @@ app.get('/api/auth/google/url', (req, res) => {
 });
 
 app.get('/api/auth/google/callback', async (req, res) => {
-  const { code, error } = req.query;
-  if (error) {
-    return res.redirect(`http://localhost:5173/?auth_error=${encodeURIComponent(String(error))}`);
+  const { code, error, state } = req.query;
+  const done = query => res.redirect(`${config.dashboardUrl}/?${query}`);
+  const initiator = oauthState.consume(typeof state === 'string' ? state : '');
+  if (!initiator) {
+    return res.status(400).send('Invalid or expired OAuth state. Start the connection again from Threadly.');
   }
-  if (!code) {
-    return res.status(400).send('Authorization code missing');
-  }
+  if (error) return done('auth_error=oauth_denied');
+  if (typeof code !== 'string' || !code) return res.status(400).send('Authorization code missing');
   try {
-    const account = await exchangeCodeForTokens(String(code));
-    // Trigger initial background sync
+    const account = await exchangeCodeForTokens(code);
     syncGmailViaOAuth(account.email, 25).then(() => {
       io.emit('conversation_created', {});
-    }).catch(() => {});
+    }).catch(err => console.warn('Initial Gmail sync failed:', err.message));
 
-    io.emit('oauth_connected', account);
-    const userRow = db.prepare('SELECT id, name, email FROM users WHERE LOWER(email) = ?').get(account.email.toLowerCase());
-    res.redirect(`http://localhost:5173/?auth_success=1&user_id=${userRow ? userRow.id : ''}&email=${encodeURIComponent(account.email)}`);
+    io.emit('oauth_connected', { email: account.email });
+    done('auth_success=1');
   } catch (err) {
-    res.redirect(`http://localhost:5173/?auth_error=${encodeURIComponent(err.message)}`);
+    console.warn('Google OAuth exchange failed:', err.message);
+    done('auth_error=oauth_failed');
   }
 });
 
-app.post('/api/auth/register', (req, res) => {
-  const { name, email, password } = req.body || {};
-  if (!name || !email) {
-    return res.status(400).json({ error: 'Name and email are required.' });
-  }
-  const cleanEmail = email.trim().toLowerCase();
-  const existing = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(cleanEmail);
-  if (existing) {
-    return res.status(400).json({ error: 'An account with this email already exists. Please sign in.' });
-  }
-  const pwdHash = hashPassword(password);
-  const userRes = db.prepare(`
-    INSERT INTO users (name, email, password_hash, role, status)
-    VALUES (?, ?, ?, 'Admin', 'Active')
-  `).run(name.trim(), cleanEmail, pwdHash);
-  const userId = userRes.lastInsertRowid;
-  const user = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(userId);
+app.post('/api/auth/register', async (req, res, next) => {
+  try {
+    const { name, email, password } = req.body || {};
+    if (typeof name !== 'string' || typeof email !== 'string' || !name.trim() || !email.trim()) {
+      return res.status(400).json({ error: 'Name and email are required.' });
+    }
+    if (typeof password !== 'string' || password.length < 10 || password.length > 1024) {
+      return res.status(400).json({ error: 'Password must be at least 10 characters.' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    const pwdHash = await hashPassword(password);
 
-  // Ensure a personal shared inbox exists for the user
-  const existingInbox = db.prepare('SELECT id FROM shared_inboxes WHERE LOWER(email) = ?').get(cleanEmail);
-  let inboxId = existingInbox?.id;
-  if (!inboxId) {
-    const inboxRes = db.prepare(`
-      INSERT INTO shared_inboxes (name, email, channel_type, auto_assign_mode, csat_enabled)
-      VALUES (?, ?, 'email', 'round_robin', 1)
-    `).run(`${name.trim()}'s Inbox`, cleanEmail);
-    inboxId = inboxRes.lastInsertRowid;
-  }
-  db.prepare('INSERT OR IGNORE INTO inbox_members (inbox_id, user_id) VALUES (?, ?)').run(inboxId, userId);
+    // From here to the INSERT everything is synchronous, so two simultaneous sign-ups cannot both
+    // become the first Admin. "First" means no account that can sign in exists yet.
+    const hasLoginAccount = Boolean(db.prepare("SELECT 1 FROM users WHERE password_hash != '' LIMIT 1").get());
+    if (hasLoginAccount && !config.allowRegistration) {
+      return res.status(403).json({ error: 'Self-service sign-up is disabled. Ask an Admin to create your account.' });
+    }
+    const existing = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(cleanEmail);
+    if (existing) {
+      return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
+    }
+    const role = hasLoginAccount ? 'Agent' : 'Admin';
+    const userRes = db.prepare(`
+      INSERT INTO users (name, email, password_hash, role, status)
+      VALUES (?, ?, ?, ?, 'Active')
+    `).run(name.trim(), cleanEmail, pwdHash, role);
+    const userId = userRes.lastInsertRowid;
+    const user = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(userId);
 
-  const sessionToken = createSession(userId);
-  io.emit('setup_updated', getSetupProgress());
-  res.json({ ok: true, user, token: sessionToken });
+    // Ensure a personal shared inbox exists for the user
+    const existingInbox = db.prepare('SELECT id FROM shared_inboxes WHERE LOWER(email) = ?').get(cleanEmail);
+    let inboxId = existingInbox?.id;
+    if (!inboxId) {
+      const inboxRes = db.prepare(`
+        INSERT INTO shared_inboxes (name, email, channel_type, auto_assign_mode, csat_enabled)
+        VALUES (?, ?, 'email', 'round_robin', 1)
+      `).run(`${name.trim()}'s Inbox`, cleanEmail);
+      inboxId = inboxRes.lastInsertRowid;
+    }
+    db.prepare('INSERT OR IGNORE INTO inbox_members (inbox_id, user_id) VALUES (?, ?)').run(inboxId, userId);
+
+    const session = createSession(userId);
+    io.emit('setup_updated', getSetupProgress());
+    res.status(201).json({ ok: true, user, token: session.token, expires_at: session.expiresAt });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required.' });
+app.post('/api/auth/login', async (req, res, next) => {
+  try {
+    const { email, password } = req.body || {};
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    const user = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(cleanEmail);
+
+    // Same work and same response whether the account exists or not (no user enumeration).
+    let authenticated = false;
+    if (user) {
+      authenticated = await verifyPassword(password, user.password_hash);
+    } else {
+      await verifyAgainstDummy(password);
+    }
+    if (!authenticated) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+    if (user.status === 'Disabled') {
+      return res.status(403).json({ error: 'This account has been disabled. Contact an Admin.' });
+    }
+
+    // Upgrade legacy single-round SHA-256 hashes (or weaker scrypt params) on successful login.
+    if (needsRehash(user.password_hash)) {
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(await hashPassword(password), user.id);
+    }
+
+    const session = createSession(user.id);
+    const safeUser = { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
+    res.json({ ok: true, user: safeUser, token: session.token, expires_at: session.expiresAt });
+  } catch (err) {
+    next(err);
   }
-  const cleanEmail = email.trim().toLowerCase();
-  const user = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(cleanEmail);
-  if (!user) {
-    return res.status(404).json({ error: 'No account found with this email. Please click "Create Account".' });
-  }
-  if (user.password_hash && password && !verifyPassword(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Incorrect password.' });
-  }
-  const sessionToken = createSession(user.id);
-  const safeUser = { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
-  res.json({ ok: true, user: safeUser, token: sessionToken });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  destroySession(req.sessionToken);
+  res.json({ ok: true });
 });
 
 app.get('/api/auth/me', (req, res) => {
-  const userId = req.headers['x-user-id'] || req.query.user_id;
-  if (!userId) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-  const user = db.prepare('SELECT id, name, email, role, status FROM users WHERE id = ?').get(userId);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-  res.json({ user });
+  res.json({ user: req.user });
 });
 
 app.get('/api/auth/google/status', (req, res) => {
-  const config = getOAuthConfig();
+  const oauthConfig = getOAuthConfig();
   const account = getConnectedAccount();
   res.json({
-    isConfigured: config.isConfigured,
-    redirectUri: config.redirectUri,
+    isConfigured: oauthConfig.isConfigured,
+    redirectUri: oauthConfig.redirectUri,
     connected: Boolean(account),
     account: account
       ? {
@@ -1840,7 +1928,7 @@ app.get('/api/auth/google/status', (req, res) => {
   });
 });
 
-app.post('/api/auth/google/sync', async (req, res) => {
+app.post('/api/auth/google/sync', requireAdmin, async (req, res) => {
   try {
     const account = getConnectedAccount();
     if (!account?.email) {
@@ -1856,16 +1944,10 @@ app.post('/api/auth/google/sync', async (req, res) => {
   }
 });
 
-app.post('/api/auth/google/disconnect', (req, res) => {
+app.post('/api/auth/google/disconnect', requireAdmin, (req, res) => {
   disconnectGoogle();
   io.emit('oauth_disconnected', {});
   res.json({ ok: true });
-});
-
-app.post('/api/auth/google/demo-login', (req, res) => {
-  const account = simulateDemoLogin(req.body?.email || 'admin@threadly.io', req.body?.name || 'Alex Rivera');
-  io.emit('oauth_connected', account);
-  res.json({ ok: true, account });
 });
 
 app.get('/api/gmail/status', (req, res) => {
@@ -1905,10 +1987,14 @@ app.post('/api/gmail/extension-bulk-sync', (req, res) => {
     items,
     emails,
   } = req.body || {};
-  const oauthAccount = getConnectedAccount();
+  // The mailbox being synced must be the caller's own address or an existing shared inbox address.
+  const requested = String(ownerEmail || account_email || '').trim().toLowerCase();
+  const knownInbox = requested
+    ? db.prepare('SELECT 1 FROM shared_inboxes WHERE LOWER(email) = ?').get(requested)
+    : null;
   const result = bulkSyncFromExtension({
-    ownerEmail: ownerEmail || account_email || oauthAccount?.email || 'admin@threadly.io',
-    items: items || emails || [],
+    ownerEmail: requested && (requested === req.user.email.toLowerCase() || knownInbox) ? requested : req.user.email,
+    items: Array.isArray(items) ? items : Array.isArray(emails) ? emails : [],
   });
   if (result.syncedCount > 0) {
     io.emit('conversation_created', {});
@@ -1916,7 +2002,10 @@ app.post('/api/gmail/extension-bulk-sync', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/seed', (req, res) => {
+app.post('/api/seed', requireAdmin, (req, res) => {
+  if (!config.allowSeed) {
+    return res.status(403).json({ error: 'Demo data seeding is disabled (set ALLOW_SEED=true to enable).' });
+  }
   seedWorkspaceData();
   io.emit('setup_updated', getSetupProgress());
   res.json({ ok: true });
@@ -1925,17 +2014,19 @@ app.post('/api/seed', (req, res) => {
 // Database operates purely on real user data (no automatic mock data)
 
 // Background sync every 60 seconds when OAuth is connected
-setInterval(async () => {
-  try {
-    const account = getConnectedAccount();
-    if (account?.email) {
-      await syncGmailViaOAuth(account.email, 15);
-      io.emit('conversation_created', {});
+function startBackgroundSync() {
+  return setInterval(async () => {
+    try {
+      const account = getConnectedAccount();
+      if (account?.email) {
+        await syncGmailViaOAuth(account.email, 15);
+        io.emit('conversation_created', {});
+      }
+    } catch (err) {
+      console.warn('Background Gmail sync failed:', err.message);
     }
-  } catch (_) {
-    // Ignore transient network errors during background poll
-  }
-}, 60000);
+  }, 60000);
+}
 
 const path = require('node:path');
 const fs = require('node:fs');
@@ -1952,8 +2043,32 @@ if (fs.existsSync(dashboardDist)) {
   });
 }
 
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`Threadly Unified Backend & Socket.io Server running on http://localhost:${PORT}`);
+// Central error handler: validation problems are the caller's fault (400); anything else is logged
+// with its stack and answered with a generic 500 so internals never reach the client.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Request body is not valid JSON.' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Request body is too large.' });
+  console.error(JSON.stringify({ level: 'error', msg: 'unhandled error', method: req.method, path: req.path, error: err && err.message, stack: err && err.stack }));
+  res.status(500).json({ error: 'Internal server error' });
 });
+
+setNotifier(convId => broadcastConversationUpdate(convId));
+
+// Only bind a port when run directly (`node src/server.js`); tests import { app } instead.
+if (require.main === module) {
+  server.listen(config.port, config.host, () => {
+    console.log(`Threadly backend listening on http://${config.host}:${config.port}`);
+    if (config.host !== '127.0.0.1' && config.host !== 'localhost' && config.allowedOrigins.length === 0) {
+      console.warn('[config] HOST is not loopback and ALLOWED_ORIGINS is empty: only same-origin browser access will work.');
+    }
+  });
+  const interrupted = recoverInterruptedDeliveries();
+  if (interrupted) console.warn(`[startup] marked ${interrupted} interrupted message(s) as failed`);
+  startScheduler();
+  startBackgroundSync();
+}
+
+module.exports = { app, server, io };
 

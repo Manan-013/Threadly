@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 const { db } = require('./db');
 const { upsertEmailIntoThreadly } = require('./gmailSync');
+const { buildRawMime } = require('./services/mailer');
 
 // Derive encryption key from process.env.ENCRYPTION_SECRET or fallback machine salt
 const ENCRYPTION_KEY = crypto.createHash('sha256')
@@ -125,20 +126,8 @@ async function exchangeCodeForTokens(code) {
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
   `).run(email);
 
-  // Ensure user is created in users table
-  const existingUser = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(email);
-  let userId;
-  if (!existingUser) {
-    const uRes = db.prepare(`
-      INSERT INTO users (name, email, role, status)
-      VALUES (?, ?, 'Admin', 'Active')
-    `).run(name, email);
-    userId = uRes.lastInsertRowid;
-  } else {
-    userId = existingUser.id;
-  }
-
-  // Ensure user's shared inbox exists
+  // Make sure the connected mailbox has a shared inbox. This never creates a user account:
+  // connecting Google must not be a way to mint (Admin) logins.
   const existingInbox = db.prepare('SELECT id FROM shared_inboxes WHERE LOWER(email) = ?').get(email);
   let inboxId = existingInbox?.id;
   if (!inboxId) {
@@ -148,9 +137,12 @@ async function exchangeCodeForTokens(code) {
     `).run(`${name}'s Inbox`, email);
     inboxId = ibRes.lastInsertRowid;
   }
-  db.prepare('INSERT OR IGNORE INTO inbox_members (inbox_id, user_id) VALUES (?, ?)').run(inboxId, userId);
+  const matchingUser = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(email);
+  if (matchingUser) {
+    db.prepare('INSERT OR IGNORE INTO inbox_members (inbox_id, user_id) VALUES (?, ?)').run(inboxId, matchingUser.id);
+  }
 
-  return { id: userId, email, name, avatarUrl };
+  return { email, name, avatarUrl };
 }
 
 function getConnectedAccount() {
@@ -309,26 +301,22 @@ async function syncGmailViaOAuth(email, maxResults = 30) {
   return { success: true, syncedCount, email };
 }
 
-async function sendGmailViaOAuth({ email, to, subject, body, inReplyTo, threadId }) {
+async function sendGmailViaOAuth({ email, fromName, to, cc = [], replyTo, subject, body, threadId }) {
   const accessToken = await getValidAccessToken(email);
   if (!accessToken) {
-    throw new Error('Google OAuth is not connected. Cannot send email.');
+    throw new Error('Google OAuth is not connected or the token expired. Reconnect Gmail in Admin > Connectors.');
   }
 
-  const lines = [
-    `From: ${email}`,
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    'Content-Type: text/plain; charset=utf-8',
-  ];
-  if (inReplyTo) {
-    lines.push(`In-Reply-To: ${inReplyTo}`);
-    lines.push(`References: ${inReplyTo}`);
-  }
-  lines.push('');
-  lines.push(body);
-
-  const raw = Buffer.from(lines.join('\r\n')).toString('base64url');
+  // The envelope is assembled and validated by services/mailer.js (no hand-built header lines).
+  const raw = (await buildRawMime({
+    fromAddress: email,
+    fromName,
+    to,
+    cc,
+    replyTo,
+    subject,
+    text: body,
+  })).toString('base64url');
 
   const sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method: 'POST',
@@ -336,18 +324,16 @@ async function sendGmailViaOAuth({ email, to, subject, body, inReplyTo, threadId
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      raw,
-      threadId: threadId || undefined,
-    }),
+    body: JSON.stringify({ raw, threadId: threadId || undefined }),
+    signal: AbortSignal.timeout(20000),
   });
 
-  const sendData = await sendRes.json();
+  const sendData = await sendRes.json().catch(() => ({}));
   if (!sendRes.ok || sendData.error) {
-    throw new Error(sendData.error?.message || 'Failed to send message via Gmail API');
+    throw new Error(sendData.error?.message || `Gmail API returned HTTP ${sendRes.status}`);
   }
 
-  return sendData;
+  return sendData; // { id, threadId, labelIds }
 }
 
 function disconnectGoogle() {
@@ -359,33 +345,6 @@ function disconnectGoogle() {
   return { ok: true };
 }
 
-function simulateDemoLogin(email = 'admin@threadly.io', name = 'Alex Rivera') {
-  const avatarUrl = '';
-  const expiresAt = Date.now() + 86400 * 1000;
-  const scopes = SCOPES.join(' ');
-  const existing = db.prepare('SELECT id FROM oauth_accounts WHERE email = ?').get(email);
-  if (existing) {
-    db.prepare(`
-      UPDATE oauth_accounts
-      SET name = ?, access_token = 'demo_token', expires_at = ?, updated_at = datetime('now')
-      WHERE email = ?
-    `).run(name, expiresAt, email);
-  } else {
-    db.prepare(`
-      INSERT INTO oauth_accounts (provider, email, name, avatar_url, access_token, refresh_token, expires_at, scopes)
-      VALUES ('google', ?, ?, ?, 'demo_token', 'demo_refresh', ?, ?)
-    `).run(email, name, avatarUrl, expiresAt, scopes);
-  }
-
-  db.prepare(`
-    INSERT INTO workspace_settings (key, value, updated_at)
-    VALUES ('google_oauth_connected_email', ?, datetime('now'))
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-  `).run(email);
-
-  return { email, name, avatarUrl };
-}
-
 module.exports = {
   getOAuthConfig,
   getAuthUrl,
@@ -395,5 +354,4 @@ module.exports = {
   syncGmailViaOAuth,
   sendGmailViaOAuth,
   disconnectGoogle,
-  simulateDemoLogin,
 };

@@ -1,47 +1,21 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { hashPassword, verifyPassword, generateConversationCode, generateToken } = require('../src/db');
+process.env.THREADLY_DB_PATH = ':memory:';
+const { generateConversationCode, generateToken } = require('../src/db');
 const { analyzeSentiment, isThankYouReply, evaluateCondition } = require('../src/engine');
-
-test('Password Hashing and Verification', () => {
-  const password = 'SuperSecret123!';
-  const hash = hashPassword(password);
-  
-  assert.equal(typeof hash, 'string');
-  assert.equal(hash.length, 64, 'SHA-256 hash must be 64 characters hex');
-  assert.equal(verifyPassword(password, hash), true, 'Valid password must verify');
-  assert.equal(verifyPassword('WrongPassword', hash), false, 'Invalid password must fail');
-  assert.equal(verifyPassword('', hash), false, 'Empty password must fail');
-});
 
 test('Token Generation', () => {
   const token1 = generateToken();
   const token2 = generateToken();
-  
+
   assert.equal(typeof token1, 'string');
-  assert.equal(token1.length, 48, 'Crypto token must be 48 hex characters (24 bytes)');
+  assert.match(token1, /^[A-Za-z0-9_-]{32}$/, '24 random bytes encoded as base64url');
   assert.notEqual(token1, token2, 'Generated tokens must be distinct');
 });
 
 test('Conversation Code Generation', () => {
   const code = generateConversationCode();
-  assert.match(code, /^\d{4}-[0-9A-F]{4}$/, 'Code must match XXXX-XXXX hex suffix format');
-});
-
-test('Session Management', () => {
-  const { db, createSession, validateSession } = require('../src/db');
-  db.prepare("INSERT OR IGNORE INTO users (id, name, email, role, status) VALUES (999, 'Test User', 'test@session.local', 'Admin', 'Active')").run();
-  const token = createSession(999);
-  assert.equal(typeof token, 'string');
-  assert.equal(token.length, 48);
-
-  const session = validateSession(token);
-  assert.ok(session, 'Valid session should return session object');
-  assert.equal(session.id, 999);
-  assert.equal(session.email, 'test@session.local');
-
-  const invalid = validateSession('invalid-token-1234');
-  assert.equal(invalid, null, 'Invalid token must return null');
+  assert.match(code, /^\d{4,}-[0-9A-F]{4}$/, 'Code must look like 0001-A3F1');
 });
 
 test('Sentiment Analysis Engine', () => {

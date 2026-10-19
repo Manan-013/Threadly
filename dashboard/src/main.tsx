@@ -3,25 +3,26 @@ import ReactDOM from 'react-dom/client';
 import { App } from './App';
 import './index.css';
 
-// Automatically attach active session token to all dashboard API requests
+// Attach the session token to every API call, and surface expired/revoked sessions (401) to the app.
 const originalFetch = window.fetch;
 window.fetch = async (...args) => {
-  let [resource, config] = args;
+  const [resource, init] = args;
+  const isApiCall = typeof resource === 'string' && resource.startsWith('/api');
+  if (!isApiCall) return originalFetch(resource, init);
+
   const token = localStorage.getItem('threadly_auth_token');
-  const userId = localStorage.getItem('threadly_active_user_id');
-  
-  if (typeof resource === 'string' && resource.startsWith('/api')) {
-    config = config || {};
-    const headers = new Headers(config.headers || {});
-    if (token && !headers.has('Authorization')) {
-      headers.set('Authorization', `Bearer ${token}`);
-    }
-    if (userId && !headers.has('x-user-id')) {
-      headers.set('x-user-id', userId);
-    }
-    config.headers = headers;
+  const headers = new Headers(init?.headers || {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
   }
-  return originalFetch(resource, config);
+  const response = await originalFetch(resource, { ...init, headers });
+
+  const isCredentialCheck = resource === '/api/auth/login' || resource === '/api/auth/register';
+  if (response.status === 401 && token && !isCredentialCheck) {
+    localStorage.removeItem('threadly_auth_token');
+    window.dispatchEvent(new Event('threadly:unauthorized'));
+  }
+  return response;
 };
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

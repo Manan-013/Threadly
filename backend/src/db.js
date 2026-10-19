@@ -1,50 +1,20 @@
 const path = require('node:path');
 const fs = require('node:fs');
+// node:sqlite ships without a flag from Node 22.13 (see "engines" in package.json and .nvmrc).
+// There is deliberately no fallback: a fake database would let the server start and tests "pass"
+// while every query returns nothing.
 let DatabaseSync;
 try {
-  DatabaseSync = require('node:sqlite').DatabaseSync;
-} catch (_) {
-  // Compatibility shim for Node < 22 runtimes (e.g. Node 20 CI test matrix)
-  class FallbackDatabaseSync {
-    constructor() {
-      this._sessions = new Map();
-    }
-    exec() {}
-    prepare(sql) {
-      return {
-        run: (...args) => {
-          if (sql.includes('INSERT INTO user_sessions')) {
-            const [token, userId] = args;
-            this._sessions.set(token, { token, id: userId, email: 'test@session.local', name: 'Test User', role: 'Admin', status: 'Active' });
-          }
-          return { lastInsertRowid: 1, changes: 1 };
-        },
-        get: (...args) => {
-          if (sql.includes('SELECT s.token, u.id')) {
-            const [token] = args;
-            return this._sessions.get(token) || null;
-          }
-          if (sql.includes('MAX(id)')) {
-            return { maxId: 0 };
-          }
-          if (sql.includes('COUNT(*)')) {
-            return { c: 1 };
-          }
-          return null;
-        },
-        all: () => []
-      };
-    }
-  }
-  DatabaseSync = FallbackDatabaseSync;
+  ({ DatabaseSync } = require('node:sqlite'));
+} catch (err) {
+  throw new Error(`Threadly needs Node.js 22.13 or newer for the built-in node:sqlite module (running ${process.version}). ${err.message}`);
 }
 
-const dataDir = path.join(__dirname, '..', 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+// config.dbPath: THREADLY_DB_PATH (':memory:' or a temp file in tests), default backend/data/threadly.sqlite
+const { dbPath } = require('./config');
+if (dbPath !== ':memory:') {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 }
-
-const dbPath = path.join(dataDir, 'threadly.sqlite');
 const db = new DatabaseSync(dbPath);
 
 // Enable WAL and Foreign Keys
@@ -169,6 +139,13 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS counters (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO counters (name, value)
+    SELECT 'conversation_code', COALESCE((SELECT MAX(id) FROM conversations), 0);
 
   CREATE TABLE IF NOT EXISTS conversation_tags (
     conversation_id INTEGER NOT NULL,
@@ -357,13 +334,25 @@ db.exec(`
     updated_at TEXT DEFAULT (datetime('now'))
   );
 
-  CREATE TABLE IF NOT EXISTS user_sessions (
-    token TEXT PRIMARY KEY,
+  -- Session tokens are never stored: only an HMAC of the token (see services/sessions.js).
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    expires_at TEXT DEFAULT (datetime('now', '+30 days')),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
+  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+  -- Legacy table that stored raw session tokens in plaintext; all old sessions are invalidated.
+  DROP TABLE IF EXISTS user_sessions;
+
+  -- Remove the fake "demo" Google account that the removed demo-login endpoint could create.
+  DELETE FROM workspace_settings
+    WHERE key = 'google_oauth_connected_email'
+      AND value IN (SELECT email FROM oauth_accounts WHERE access_token = 'demo_token');
+  DELETE FROM oauth_accounts WHERE access_token = 'demo_token';
 `);
 
 // Security: Purge any legacy raw app passwords from settings
@@ -379,45 +368,44 @@ try {
 
 const crypto = require('node:crypto');
 
-function createSession(userId) {
-  const token = crypto.randomBytes(24).toString('hex');
-  db.prepare(`
-    INSERT INTO user_sessions (token, user_id)
-    VALUES (?, ?)
-  `).run(token, userId);
-  return token;
+/** Adds a column when it does not exist yet. Returns true if the column was added by this call. */
+function addColumnIfMissing(table, column, ddl) {
+  const exists = db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column);
+  if (exists) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  return true;
 }
 
-function validateSession(token) {
-  if (!token) return null;
-  const session = db.prepare(`
-    SELECT s.token, u.id, u.name, u.email, u.role, u.status
-    FROM user_sessions s
-    JOIN users u ON u.id = s.user_id
-    WHERE s.token = ? AND datetime(s.expires_at) > datetime('now')
-  `).get(token);
-  return session || null;
+// Outbound delivery state for agent replies (see services/delivery.js).
+const deliveryColumnsAdded = addColumnIfMissing('messages', 'error', 'TEXT');
+addColumnIfMissing('messages', 'sent_at', 'TEXT');
+addColumnIfMissing('messages', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('messages', 'delivery_mode', "TEXT NOT NULL DEFAULT 'server'");
+addColumnIfMissing('messages', 'close_on_send', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('messages', 'provider_message_id', 'TEXT');
+if (deliveryColumnsAdded) {
+  // Earlier versions accepted "send later" but nothing ever sent those messages. Do not let a new
+  // worker suddenly email customers about stale drafts: surface them as failed so a person decides.
+  db.exec(`
+    UPDATE messages
+    SET status = 'failed',
+        error = 'This scheduled message was never sent by an earlier version. Review it and retry if it is still relevant.'
+    WHERE status = 'scheduled'
+  `);
 }
 
-function hashPassword(password) {
-  if (!password) return '';
-  return crypto.createHash('sha256').update(password + 'threadly_salt_2026').digest('hex');
-}
-
-function verifyPassword(password, hash) {
-  if (!hash) return true; // If user signed up via OAuth without password
-  return hashPassword(password) === hash;
-}
-
+// Conversation codes look like 0042-A3F1. The number comes from a persistent, atomically incremented
+// counter (never MAX(id)/COUNT(*), which repeat after deletes), so two codes can never collide.
+// The random suffix only makes codes non-enumerable.
 function generateConversationCode() {
-  const row = db.prepare('SELECT MAX(id) as maxId FROM conversations').get();
-  const nextNum = (row?.maxId || 0) + 1;
+  const row = db.prepare("UPDATE counters SET value = value + 1 WHERE name = 'conversation_code' RETURNING value").get();
   const suffix = crypto.randomBytes(2).toString('hex').toUpperCase();
-  return `${String(nextNum).padStart(4, '0')}-${suffix}`;
+  return `${String(row.value).padStart(4, '0')}-${suffix}`;
 }
 
+// 192 bits of randomness, URL-safe. Used for public share tokens and webhook secrets.
 function generateToken() {
-  return crypto.randomBytes(24).toString('hex');
+  return crypto.randomBytes(24).toString('base64url');
 }
 
 function logActivity(conversationId, actorName, activityType, description, metadata = {}) {
@@ -449,10 +437,6 @@ function getSetupProgress() {
 
 module.exports = {
   db,
-  createSession,
-  validateSession,
-  hashPassword,
-  verifyPassword,
   generateConversationCode,
   generateToken,
   logActivity,
