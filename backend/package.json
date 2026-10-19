@@ -13,7 +13,7 @@
     "dotenv": "^18.0.8",
     "express": "^4.21.2",
     "imapflow": "^2.4.0",
-    "mailparser": "^3.9.38",
+    "mailparser": "^3.9.40",
     "nodemailer": "^10.1.0",
     "socket.io": "^4.8.1"
   }
