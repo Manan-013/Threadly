@@ -39,12 +39,11 @@ try {
   DatabaseSync = FallbackDatabaseSync;
 }
 
-const dataDir = path.join(__dirname, '..', 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+// THREADLY_DB_PATH lets tests use ':memory:' or a temp file; default is backend/data/threadly.sqlite
+const dbPath = process.env.THREADLY_DB_PATH || path.join(__dirname, '..', 'data', 'threadly.sqlite');
+if (dbPath !== ':memory:') {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 }
-
-const dbPath = path.join(dataDir, 'threadly.sqlite');
 const db = new DatabaseSync(dbPath);
 
 // Enable WAL and Foreign Keys

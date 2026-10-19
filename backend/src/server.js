@@ -1925,17 +1925,19 @@ app.post('/api/seed', (req, res) => {
 // Database operates purely on real user data (no automatic mock data)
 
 // Background sync every 60 seconds when OAuth is connected
-setInterval(async () => {
-  try {
-    const account = getConnectedAccount();
-    if (account?.email) {
-      await syncGmailViaOAuth(account.email, 15);
-      io.emit('conversation_created', {});
+function startBackgroundSync() {
+  return setInterval(async () => {
+    try {
+      const account = getConnectedAccount();
+      if (account?.email) {
+        await syncGmailViaOAuth(account.email, 15);
+        io.emit('conversation_created', {});
+      }
+    } catch (err) {
+      console.warn('Background Gmail sync failed:', err.message);
     }
-  } catch (_) {
-    // Ignore transient network errors during background poll
-  }
-}, 60000);
+  }, 60000);
+}
 
 const path = require('node:path');
 const fs = require('node:fs');
@@ -1952,8 +1954,14 @@ if (fs.existsSync(dashboardDist)) {
   });
 }
 
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`Threadly Unified Backend & Socket.io Server running on http://localhost:${PORT}`);
-});
+// Only bind a port when run directly (`node src/server.js`); tests import { app } instead.
+if (require.main === module) {
+  const PORT = process.env.PORT || 4000;
+  server.listen(PORT, () => {
+    console.log(`Threadly Unified Backend & Socket.io Server running on http://localhost:${PORT}`);
+  });
+  startBackgroundSync();
+}
+
+module.exports = { app, server, io };
 
