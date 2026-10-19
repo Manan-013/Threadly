@@ -30,13 +30,17 @@ const { createSession, validateSession, destroySession, destroySessionsForUser }
 const { requireAuth, requireAdmin, authGate } = require('./middleware/auth');
 const oauthState = require('./services/oauthState');
 const { hostGuard, corsMiddleware, socketAllowRequest, socketCorsOrigin } = require('./middleware/cors');
-const { seedWorkspaceData } = require('./seed');
+const { ValidationError, parseCcList, assertNoHeaderInjection } = require('./services/mailer');
 const {
-  getSavedGmailCredentials,
-  syncGmailImap,
-  sendGmailSmtp,
-  bulkSyncFromExtension,
-} = require('./gmailSync');
+  deliverMessage,
+  applySentEffects,
+  claimForRetry,
+  setNotifier,
+  startScheduler,
+  recoverInterruptedDeliveries,
+} = require('./services/delivery');
+const { seedWorkspaceData } = require('./seed');
+const { bulkSyncFromExtension } = require('./gmailSync');
 const {
   getOAuthConfig,
   getAuthUrl,
@@ -44,7 +48,6 @@ const {
   getConnectedAccount,
   getValidAccessToken,
   syncGmailViaOAuth,
-  sendGmailViaOAuth,
   disconnectGoogle,
 } = require('./googleAuth');
 
@@ -1024,126 +1027,151 @@ app.delete('/api/conversations/:id/tags/:tagId', (req, res) => {
 });
 
 // Send Reply / Message / Split Conversation / Send & Close / Send Later
-app.post('/api/conversations/:id/messages', (req, res) => {
-  const convId = Number(req.params.id);
-  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
-  if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+//
+// Agent replies:
+//  - To: always the conversation's customer. A different `recipient_email` is rejected.
+//  - From: the connected mailbox (services/delivery.js); the sender name comes from the session.
+//  - The row is created as 'sending' (or 'scheduled'), and becomes 'sent' only after the provider
+//    accepted it, or 'failed' with the error stored. A failed delivery answers HTTP 502.
+//  - delivery: 'external' records a reply that the caller sends itself (the Gmail extension clicks
+//    Gmail's own Send button); the server then does NOT send a second copy.
+app.post('/api/conversations/:id/messages', async (req, res, next) => {
+  try {
+    const convId = Number(req.params.id);
+    const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
+    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
-  const {
-    recipient_email,
-    cc_emails = '',
-    body,
-    is_agent_reply = 1,
-    is_private_split = 0,
-    scheduled_for = null,
-    close_on_send = false,
-  } = req.body;
+    const {
+      recipient_email,
+      cc_emails = '',
+      body,
+      is_agent_reply = 1,
+      is_private_split = 0,
+      scheduled_for = null,
+      close_on_send = false,
+      delivery = 'server',
+    } = req.body;
 
-  if (!body || !body.trim()) return res.status(400).json({ error: 'Message body is required' });
+    if (typeof body !== 'string' || !body.trim()) return res.status(400).json({ error: 'Message body is required' });
+    if (body.length > 100000) return res.status(400).json({ error: 'Message body is too long' });
 
-  // Sender identity comes from the session (agent) or the conversation (customer), never from the request.
-  const sender_name = is_agent_reply ? req.user.name : conv.customer_name;
-  const sender_email = is_agent_reply ? req.user.email : conv.customer_email;
+    if (!is_agent_reply) {
+      // Simulated/inbound customer message: identity comes from the conversation.
+      db.prepare(`
+        INSERT INTO messages (conversation_id, sender_name, sender_email, recipient_email, body, is_agent_reply, status)
+        VALUES (?, ?, ?, ?, ?, 0, 'sent')
+      `).run(convId, conv.customer_name, conv.customer_email, 'inbox@threadly.app', body.trim());
 
-  const msgStatus = scheduled_for ? 'scheduled' : 'sent';
-  const insertInfo = db.prepare(`
-    INSERT INTO messages (
-      conversation_id, sender_name, sender_email, recipient_email, cc_emails,
-      body, is_agent_reply, is_private_split, scheduled_for, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    convId,
-    sender_name || (is_agent_reply ? 'Agent' : conv.customer_name),
-    sender_email || (is_agent_reply ? 'agent@threadly.app' : conv.customer_email),
-    recipient_email || (is_agent_reply ? conv.customer_email : 'inbox@threadly.app'),
-    cc_emails,
-    body.trim(),
-    is_agent_reply ? 1 : 0,
-    is_private_split ? 1 : 0,
-    scheduled_for,
-    msgStatus
-  );
-  const msgId = insertInfo.lastInsertRowid;
-
-  // Clear shared draft once sent
-  if (is_agent_reply) {
-    db.prepare('DELETE FROM shared_drafts WHERE conversation_id = ?').run(convId);
-    db.prepare(`
-      UPDATE conversations
-      SET first_responded_at = COALESCE(first_responded_at, datetime('now')),
-          updated_at = datetime('now')
-      WHERE id = ?
-    `).run(convId);
-
-    if (is_private_split) {
-      logActivity(convId, sender_name || 'You', 'split_conversation', `${sender_name || 'You'} replied privately via Split conversation.`);
-    } else if (scheduled_for) {
-      logActivity(convId, sender_name || 'You', 'replied', `${sender_name || 'You'} scheduled a reply for ${new Date(scheduled_for).toLocaleString()}.`);
-    } else {
-      logActivity(convId, sender_name || 'You', 'replied', `${sender_name || 'You'} replied to ${conv.customer_name}.`);
+      if (conv.status === 'Closed' && isThankYouReply(body)) {
+        logActivity(convId, 'Threadly AI', 'automation_triggered',
+          'AI Auto-Closer detected a thank-you reply and kept the conversation Closed.');
+      } else if (conv.status === 'Closed') {
+        db.prepare(`UPDATE conversations SET status = 'Open', updated_at = datetime('now') WHERE id = ?`).run(convId);
+        logActivity(convId, conv.customer_name, 'status_changed', 'Conversation reopened by customer reply.');
+      }
+      broadcastConversationUpdate(convId);
+      return res.json(hydrateConversation(convId));
     }
 
-    if (close_on_send) {
-      db.prepare(`UPDATE conversations SET status = 'Closed', resolved_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(convId);
-      logActivity(convId, sender_name || 'You', 'status_changed', `${sender_name || 'You'} closed conversation via Send & Close.`);
+    // ---- agent reply: validate everything before anything is written
+    if (!['server', 'external'].includes(delivery)) {
+      return res.status(400).json({ error: "delivery must be 'server' or 'external'" });
     }
-
-    if (!scheduled_for) {
-      const oauthAcc = getConnectedAccount();
-      // Ensure sender is restricted to connected email or provisioned team inbox
-      const allowedSenders = [oauthAcc?.email, conv.inbox_email, req.user?.email].filter(Boolean).map(e => e.toLowerCase());
-      const targetFromEmail = (sender_email && allowedSenders.includes(sender_email.toLowerCase()))
-        ? sender_email
-        : (oauthAcc?.email || conv.inbox_email || 'support@threadly.app');
-
-      // Only allow sending to the customer's actual conversation thread email or explicit verified recipient
-      const targetToEmail = recipient_email ? recipient_email.trim() : conv.customer_email;
-
-      if (oauthAcc?.email) {
-        sendGmailViaOAuth({
-          email: oauthAcc.email,
-          to: targetToEmail,
-          subject: conv.subject.startsWith('Re:') ? conv.subject : `Re: ${conv.subject}`,
-          body: body.trim(),
-        }).catch(err => {
-          console.warn('Google OAuth send failed:', err.message);
-          db.prepare('UPDATE messages SET status = "failed" WHERE id = ?').run(msgId);
-          logActivity(convId, 'System', 'delivery_failed', `Failed to deliver email: ${err.message}`);
-          broadcastConversationUpdate(convId);
-        });
-      } else {
-        sendGmailSmtp({
-          fromEmail: targetFromEmail,
-          fromName: sender_name || 'Support Team',
-          toEmail: targetToEmail,
-          ccEmails: cc_emails,
-          subject: conv.subject.startsWith('Re:') ? conv.subject : `Re: ${conv.subject}`,
-          body: body.trim(),
-        }).catch(err => {
-          console.warn('SMTP send failed:', err.message);
-          db.prepare('UPDATE messages SET status = "failed" WHERE id = ?').run(msgId);
-          logActivity(convId, 'System', 'delivery_failed', `Failed to deliver email via SMTP: ${err.message}`);
-          broadcastConversationUpdate(convId);
-        });
+    if (recipient_email !== undefined && recipient_email !== null && recipient_email !== '') {
+      assertNoHeaderInjection(recipient_email, 'Recipient');
+      if (String(recipient_email).trim().toLowerCase() !== String(conv.customer_email).toLowerCase()) {
+        return res.status(400).json({ error: "Replies can only be sent to this conversation's customer address." });
       }
     }
-  } else {
-    // Customer reply: check AI Thank-You Detector if conversation is currently Closed
-    if (conv.status === 'Closed' && isThankYouReply(body)) {
-      logActivity(
-        convId,
-        'Threadly AI',
-        'automation_triggered',
-        'AI Auto-Closer detected a thank-you reply and kept the conversation Closed.'
-      );
-    } else if (conv.status === 'Closed') {
-      db.prepare(`UPDATE conversations SET status = 'Open', updated_at = datetime('now') WHERE id = ?`).run(convId);
-      logActivity(convId, conv.customer_name, 'status_changed', 'Conversation reopened by customer reply.');
-    }
-  }
+    const cc = parseCcList(cc_emails); // throws ValidationError (400) on bad addresses or CR/LF
 
-  broadcastConversationUpdate(convId);
-  res.json(hydrateConversation(convId));
+    let scheduledIso = null;
+    if (scheduled_for) {
+      const when = new Date(scheduled_for);
+      const now = Date.now();
+      if (Number.isNaN(when.getTime())) return res.status(400).json({ error: 'scheduled_for is not a valid date.' });
+      if (when.getTime() <= now) return res.status(400).json({ error: 'scheduled_for must be in the future.' });
+      if (when.getTime() > now + 366 * 24 * 3600 * 1000) return res.status(400).json({ error: 'scheduled_for must be within one year.' });
+      if (delivery === 'external') return res.status(400).json({ error: 'External replies cannot be scheduled.' });
+      scheduledIso = when.toISOString();
+    }
+
+    const sender_name = req.user.name; // identity from the session, never from the body
+    const status = scheduledIso ? 'scheduled' : delivery === 'external' ? 'sent' : 'sending';
+    const insert = db.prepare(`
+      INSERT INTO messages (
+        conversation_id, sender_name, sender_email, recipient_email, cc_emails, body,
+        is_agent_reply, is_private_split, scheduled_for, status, delivery_mode, close_on_send, sent_at, attempts
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ${status === 'sent' ? "datetime('now')" : 'NULL'}, ?)
+    `).run(
+      convId,
+      sender_name,
+      req.user.email,
+      conv.customer_email,
+      cc.join(', '),
+      body.trim(),
+      is_private_split ? 1 : 0,
+      scheduledIso,
+      status,
+      delivery,
+      close_on_send ? 1 : 0,
+      status === 'sending' ? 1 : 0
+    );
+    const msgId = Number(insert.lastInsertRowid);
+    db.prepare('DELETE FROM shared_drafts WHERE conversation_id = ?').run(convId);
+
+    if (status === 'scheduled') {
+      logActivity(convId, sender_name, 'replied', `${sender_name} scheduled a reply for ${new Date(scheduledIso).toLocaleString()}.`);
+      broadcastConversationUpdate(convId);
+      return res.json(hydrateConversation(convId));
+    }
+
+    if (status === 'sent') {
+      // External: the caller sends it (Gmail UI); we only record it.
+      applySentEffects({ conversation_id: convId, sender_name, is_private_split, close_on_send, customer_name: conv.customer_name });
+      broadcastConversationUpdate(convId);
+      return res.json(hydrateConversation(convId));
+    }
+
+    const outcome = await deliverMessage(msgId);
+    broadcastConversationUpdate(convId);
+    if (!outcome.ok) {
+      return res.status(502).json({
+        error: `Message saved but not delivered: ${outcome.error}`,
+        message_id: msgId,
+        conversation: hydrateConversation(convId),
+      });
+    }
+    res.json(hydrateConversation(convId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Retry a message whose delivery failed.
+app.post('/api/messages/:id/retry', async (req, res, next) => {
+  try {
+    const msgId = Number(req.params.id);
+    const msg = db.prepare('SELECT id, conversation_id, status, delivery_mode FROM messages WHERE id = ?').get(msgId);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+    if (msg.status !== 'failed' || msg.delivery_mode !== 'server') {
+      return res.status(409).json({ error: 'Only messages whose delivery failed can be retried.' });
+    }
+    if (!claimForRetry(msgId)) return res.status(409).json({ error: 'This message is already being retried.' });
+
+    const outcome = await deliverMessage(msgId);
+    broadcastConversationUpdate(msg.conversation_id);
+    if (!outcome.ok) {
+      return res.status(502).json({
+        error: `Message not delivered: ${outcome.error}`,
+        message_id: msgId,
+        conversation: hydrateConversation(msg.conversation_id),
+      });
+    }
+    res.json(hydrateConversation(msg.conversation_id));
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Internal Notes (+ Add a note... or Save as note from AI Summarizer)
@@ -2015,6 +2043,19 @@ if (fs.existsSync(dashboardDist)) {
   });
 }
 
+// Central error handler: validation problems are the caller's fault (400); anything else is logged
+// with its stack and answered with a generic 500 so internals never reach the client.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Request body is not valid JSON.' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Request body is too large.' });
+  console.error(JSON.stringify({ level: 'error', msg: 'unhandled error', method: req.method, path: req.path, error: err && err.message, stack: err && err.stack }));
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+setNotifier(convId => broadcastConversationUpdate(convId));
+
 // Only bind a port when run directly (`node src/server.js`); tests import { app } instead.
 if (require.main === module) {
   server.listen(config.port, config.host, () => {
@@ -2023,6 +2064,9 @@ if (require.main === module) {
       console.warn('[config] HOST is not loopback and ALLOWED_ORIGINS is empty: only same-origin browser access will work.');
     }
   });
+  const interrupted = recoverInterruptedDeliveries();
+  if (interrupted) console.warn(`[startup] marked ${interrupted} interrupted message(s) as failed`);
+  startScheduler();
   startBackgroundSync();
 }
 

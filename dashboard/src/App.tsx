@@ -106,6 +106,7 @@ export const App: React.FC = () => {
   // Compose & Shared Draft state (Screenshot 000437 & 000449)
   const [composeOpen, setComposeOpen] = useState(true);
   const [draftBody, setDraftBody] = useState('');
+  const [sendError, setSendError] = useState<string | null>(null);
   const [draftTo, setDraftTo] = useState('');
   const [isSplitPrivate, setIsSplitPrivate] = useState(false);
   const [showCautionBanner, setShowCautionBanner] = useState(true);
@@ -461,12 +462,13 @@ export const App: React.FC = () => {
 
   const handleSendReply = async (closeOnSend = false, scheduledFor: string | null = null) => {
     if (!activeConversation || !draftBody.trim()) return;
+    setSendError(null);
+    // The sender comes from your session and the mailbox is the connected Gmail account; only the
+    // customer of this conversation can be the recipient (the server rejects anything else).
     const res = await fetch(`/api/conversations/${activeConversation.id}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        sender_name: currentUserName,
-        sender_email: currentUser?.email || 'agent@threadly.app',
         recipient_email: draftTo || activeConversation.customer_email,
         body: draftBody.trim(),
         is_agent_reply: 1,
@@ -475,13 +477,33 @@ export const App: React.FC = () => {
         close_on_send: closeOnSend,
       }),
     });
-    const updated = await res.json();
-    setActiveConversation(updated);
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      setActiveConversation(data);
+    } else {
+      setSendError(data.error || 'The message could not be sent.');
+      if (res.status !== 502) return; // rejected before saving: keep the draft so it can be fixed
+      // 502: saved but not delivered. It now shows as "Not delivered" with a Retry button.
+      if (data.conversation) setActiveConversation(data.conversation);
+    }
     setDraftBody('');
     setIsSharedDraftActive(false);
     setShowSendLaterPopover(false);
     fetchConversations();
     fetchBootstrap();
+  };
+
+  const handleRetryMessage = async (messageId: number) => {
+    setSendError(null);
+    const res = await fetch(`/api/messages/${messageId}/retry`, { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      setActiveConversation(data);
+    } else {
+      setSendError(data.error || 'Retry failed.');
+      if (data.conversation) setActiveConversation(data.conversation);
+    }
+    fetchConversations();
   };
 
   const handleCustomerIncomingReply = async (e: React.FormEvent) => {
@@ -491,9 +513,6 @@ export const App: React.FC = () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        sender_name: activeConversation.customer_name,
-        sender_email: activeConversation.customer_email,
-        recipient_email: activeConversation.inbox_email || 'inbox@threadly.app',
         body: customerReplyInput.trim(),
         is_agent_reply: 0,
       }),
@@ -1885,6 +1904,16 @@ export const App: React.FC = () => {
                                 Scheduled
                               </span>
                             )}
+                            {msg.status === 'sending' && (
+                              <span className="ml-2 px-2 py-0.5 rounded bg-[#E0F2FE] text-[10px] font-semibold text-[#0369A1]">
+                                Sending…
+                              </span>
+                            )}
+                            {msg.status === 'failed' && (
+                              <span className="ml-2 px-2 py-0.5 rounded bg-[#FEE2E2] text-[10px] font-semibold text-[#B91C1C]">
+                                Not delivered
+                              </span>
+                            )}
                             <div className="text-[11px] text-[#64748B]">
                               to {msg.recipient_email}
                             </div>
@@ -1905,10 +1934,32 @@ export const App: React.FC = () => {
                         <div className="mt-2.5 text-xs text-[#0F172A] whitespace-pre-line leading-relaxed">
                           {msg.body}
                         </div>
+                        {msg.status === 'failed' && (
+                          <div className="mt-2 flex items-center gap-3 text-[11px] text-[#B91C1C]">
+                            <span>{msg.error || 'Delivery failed.'}</span>
+                            {msg.delivery_mode === 'server' && (
+                              <button
+                                onClick={() => handleRetryMessage(msg.id)}
+                                className="px-2 py-0.5 rounded border border-[#FECACA] hover:bg-[#FEF2F2] font-semibold"
+                              >
+                                Retry
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
                   ))}
                 </div>
+
+                {sendError && (
+                  <div
+                    role="alert"
+                    className="p-3 rounded-lg bg-[#FEF2F2] border border-[#FECACA] text-xs text-[#991B1B]"
+                  >
+                    {sendError}
+                  </div>
+                )}
 
                 {/* Reply / Reply All / Forward Pill Buttons matching Screenshot 000429.png */}
                 {!composeOpen && (
@@ -2131,7 +2182,8 @@ export const App: React.FC = () => {
                                   <button
                                     onClick={() => {
                                       if (sendLaterDateTime) {
-                                        handleSendReply(false, sendLaterDateTime);
+                                        // datetime-local carries no timezone: send an absolute instant so the server schedules it correctly.
+                                        handleSendReply(false, new Date(sendLaterDateTime).toISOString());
                                       }
                                     }}
                                     className="w-full py-1.5 bg-[#DC2626] hover:bg-[#B91C1C] text-white text-xs font-medium rounded flex items-center justify-center gap-1"

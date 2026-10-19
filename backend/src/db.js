@@ -397,6 +397,32 @@ try {
 
 const crypto = require('node:crypto');
 
+/** Adds a column when it does not exist yet. Returns true if the column was added by this call. */
+function addColumnIfMissing(table, column, ddl) {
+  const exists = db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column);
+  if (exists) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  return true;
+}
+
+// Outbound delivery state for agent replies (see services/delivery.js).
+const deliveryColumnsAdded = addColumnIfMissing('messages', 'error', 'TEXT');
+addColumnIfMissing('messages', 'sent_at', 'TEXT');
+addColumnIfMissing('messages', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('messages', 'delivery_mode', "TEXT NOT NULL DEFAULT 'server'");
+addColumnIfMissing('messages', 'close_on_send', 'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('messages', 'provider_message_id', 'TEXT');
+if (deliveryColumnsAdded) {
+  // Earlier versions accepted "send later" but nothing ever sent those messages. Do not let a new
+  // worker suddenly email customers about stale drafts: surface them as failed so a person decides.
+  db.exec(`
+    UPDATE messages
+    SET status = 'failed',
+        error = 'This scheduled message was never sent by an earlier version. Review it and retry if it is still relevant.'
+    WHERE status = 'scheduled'
+  `);
+}
+
 // Conversation codes look like 0042-A3F1. The number comes from a persistent, atomically incremented
 // counter (never MAX(id)/COUNT(*), which repeat after deletes), so two codes can never collide.
 // The random suffix only makes codes non-enumerable.

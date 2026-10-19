@@ -150,7 +150,7 @@ test('actor/author names come from the session, not from the request body', asyn
   assert.ok(patched.body.activities.some(a => a.activity_type === 'status_changed' && a.actor_name === 'Second'));
 
   const sent = await request(app).post(`/api/conversations/${conv.id}/messages`).set(bearer(agent.token))
-    .send({ body: 'hi', sender_name: 'CEO', sender_email: 'ceo@example.com', is_agent_reply: 1 });
+    .send({ body: 'hi', sender_name: 'CEO', sender_email: 'ceo@example.com', is_agent_reply: 1, delivery: 'external' });
   const msg = sent.body.messages.at(-1);
   assert.equal(msg.sender_name, 'Second');
   assert.equal(msg.sender_email, 'second@example.com');
