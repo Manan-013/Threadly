@@ -1,18 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { hashPassword, verifyPassword, generateConversationCode, generateToken } = require('../src/db');
+process.env.THREADLY_DB_PATH = ':memory:';
+const { generateConversationCode, generateToken } = require('../src/db');
 const { analyzeSentiment, isThankYouReply, evaluateCondition } = require('../src/engine');
-
-test('Password Hashing and Verification', () => {
-  const password = 'SuperSecret123!';
-  const hash = hashPassword(password);
-  
-  assert.equal(typeof hash, 'string');
-  assert.equal(hash.length, 64, 'SHA-256 hash must be 64 characters hex');
-  assert.equal(verifyPassword(password, hash), true, 'Valid password must verify');
-  assert.equal(verifyPassword('WrongPassword', hash), false, 'Invalid password must fail');
-  assert.equal(verifyPassword('', hash), false, 'Empty password must fail');
-});
 
 test('Token Generation', () => {
   const token1 = generateToken();

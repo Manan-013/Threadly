@@ -7,8 +7,6 @@ const {
   db,
   createSession,
   validateSession,
-  hashPassword,
-  verifyPassword,
   generateConversationCode,
   generateToken,
   logActivity,
@@ -23,6 +21,12 @@ const {
   generateAiSummary,
   generateSmartReply,
 } = require('./engine');
+const {
+  hashPassword,
+  verifyPassword,
+  needsRehash,
+  verifyAgainstDummy,
+} = require('./services/passwords');
 const { seedWorkspaceData } = require('./seed');
 const {
   getSavedGmailCredentials,
@@ -1757,17 +1761,21 @@ app.get('/api/auth/google/callback', async (req, res) => {
   }
 });
 
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res, next) => {
+  try {
   const { name, email, password } = req.body || {};
-  if (!name || !email) {
+  if (typeof name !== 'string' || typeof email !== 'string' || !name.trim() || !email.trim()) {
     return res.status(400).json({ error: 'Name and email are required.' });
+  }
+  if (typeof password !== 'string' || password.length < 10 || password.length > 1024) {
+    return res.status(400).json({ error: 'Password must be at least 10 characters.' });
   }
   const cleanEmail = email.trim().toLowerCase();
   const existing = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(cleanEmail);
   if (existing) {
     return res.status(400).json({ error: 'An account with this email already exists. Please sign in.' });
   }
-  const pwdHash = hashPassword(password);
+  const pwdHash = await hashPassword(password);
   const userRes = db.prepare(`
     INSERT INTO users (name, email, password_hash, role, status)
     VALUES (?, ?, ?, 'Admin', 'Active')
@@ -1790,24 +1798,42 @@ app.post('/api/auth/register', (req, res) => {
   const sessionToken = createSession(userId);
   io.emit('setup_updated', getSetupProgress());
   res.json({ ok: true, user, token: sessionToken });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required.' });
+app.post('/api/auth/login', async (req, res, next) => {
+  try {
+    const { email, password } = req.body || {};
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    const user = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(cleanEmail);
+
+    // Same work and same response whether the account exists or not (no user enumeration).
+    let authenticated = false;
+    if (user) {
+      authenticated = await verifyPassword(password, user.password_hash);
+    } else {
+      await verifyAgainstDummy(password);
+    }
+    if (!authenticated) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    // Upgrade legacy single-round SHA-256 hashes (or weaker scrypt params) on successful login.
+    if (needsRehash(user.password_hash)) {
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(await hashPassword(password), user.id);
+    }
+
+    const sessionToken = createSession(user.id);
+    const safeUser = { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
+    res.json({ ok: true, user: safeUser, token: sessionToken });
+  } catch (err) {
+    next(err);
   }
-  const cleanEmail = email.trim().toLowerCase();
-  const user = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(cleanEmail);
-  if (!user) {
-    return res.status(404).json({ error: 'No account found with this email. Please click "Create Account".' });
-  }
-  if (user.password_hash && password && !verifyPassword(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Incorrect password.' });
-  }
-  const sessionToken = createSession(user.id);
-  const safeUser = { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
-  res.json({ ok: true, user: safeUser, token: sessionToken });
 });
 
 app.get('/api/auth/me', (req, res) => {

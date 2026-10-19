@@ -49,7 +49,7 @@ Traditional helpdesks like Zendesk, Front, and Intercom force support teams to a
 - **Shared Drafts & Split Private Replies**: Draft responses cooperatively with your team before dispatching to the client.
 
 ### Privacy & Authentication
-- **Built-In Email & Password Auth**: Secure user registration and login powered by cryptographic `PBKDF2-SHA512` hashing.
+- **Built-In Email & Password Auth**: Registration and login with passwords hashed using `scrypt` (N=2^15, r=8, p=1) with a random per-user salt and constant-time comparison. Hashes from older versions are upgraded automatically on the next successful login.
 - **Zero Third-Party Telemetry**: No tracking pixels, external data brokers, or proprietary cloud dependencies.
 
 ---

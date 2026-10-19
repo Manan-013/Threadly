@@ -398,16 +398,6 @@ function validateSession(token) {
   return session || null;
 }
 
-function hashPassword(password) {
-  if (!password) return '';
-  return crypto.createHash('sha256').update(password + 'threadly_salt_2026').digest('hex');
-}
-
-function verifyPassword(password, hash) {
-  if (!hash) return true; // If user signed up via OAuth without password
-  return hashPassword(password) === hash;
-}
-
 function generateConversationCode() {
   const row = db.prepare('SELECT MAX(id) as maxId FROM conversations').get();
   const nextNum = (row?.maxId || 0) + 1;
@@ -450,8 +440,6 @@ module.exports = {
   db,
   createSession,
   validateSession,
-  hashPassword,
-  verifyPassword,
   generateConversationCode,
   generateToken,
   logActivity,
