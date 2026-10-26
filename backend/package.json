@@ -10,7 +10,7 @@
     "set-password": "node scripts/set-password.js"
   },
   "dependencies": {
-    "dotenv": "^18.0.8",
+    "dotenv": "^18.0.9",
     "express": "^4.21.2",
     "nodemailer": "^10.1.0",
     "socket.io": "^4.8.1"
